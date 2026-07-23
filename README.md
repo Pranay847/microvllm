@@ -56,6 +56,12 @@ Sanitizer presets set `MICROVLLM_BUILD_LLAMA=OFF` on purpose. Instrumenting ggml
 buries first-party findings under backend noise and makes the build unusably slow; with the
 backend excluded, any report from `wsl-tsan` is necessarily about code in this repo.
 
+On Ubuntu 24.04 (including GitHub Actions runners) TSan binaries abort at startup with
+`unexpected memory mapping` — the kernel's `vm.mmap_rnd_bits=32` exceeds what TSan's shadow
+mapping tolerates. The build handles this by running TSan tests under `setarch -R`, which needs
+no privileges. Race detection is unaffected: TSan works from happens-before tracking, not
+address layout.
+
 ## Layout
 
 ```
