@@ -16,12 +16,23 @@ add_library(microvllm::core ALIAS microvllm_core)
 # microvllm_llama -- the only translation units allowed to include llama.h.
 # ---------------------------------------------------------------------------
 if(MICROVLLM_BUILD_LLAMA)
+    # Upstream renamed this target from `common` to `llama-common`. CMake silently
+    # degrades an unknown target name into a raw `-l<name>` link flag, so without
+    # this check a rename surfaces as a cryptic "cannot find -lcommon" at link time.
+    foreach(_dep llama llama-common)
+        if(NOT TARGET ${_dep})
+            message(FATAL_ERROR
+                "Expected llama.cpp to define target '${_dep}'. The pinned submodule "
+                "(third_party/llama.cpp) may have renamed it. Check its CMakeLists.")
+        endif()
+    endforeach()
+
     add_library(microvllm_llama STATIC
         engine/llama_engine.cpp
     )
     target_link_libraries(microvllm_llama
         PUBLIC  microvllm_core
-        PRIVATE llama common)
+        PRIVATE llama llama-common)
     add_library(microvllm::llama ALIAS microvllm_llama)
 endif()
 
