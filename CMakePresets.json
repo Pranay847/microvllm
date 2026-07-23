@@ -1,0 +1,100 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+
+  "configurePresets": [
+    {
+      "name": "wsl-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "description": "Build trees live on WSL native fs, never under /mnt/c -- object writes across drvfs dominate build time otherwise.",
+      "binaryDir": "$env{HOME}/build/microvllm/${presetName}",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "wsl-debug",
+      "inherits": "wsl-base",
+      "displayName": "WSL Debug",
+      "description": "Unoptimized build with assertions, for day-to-day development.",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "wsl-release",
+      "inherits": "wsl-base",
+      "displayName": "WSL Release",
+      "description": "Optimized build. All published benchmark numbers must come from this preset.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MICROVLLM_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "wsl-asan-ubsan",
+      "inherits": "wsl-base",
+      "displayName": "WSL ASan + UBSan",
+      "description": "Sanitizes first-party code only. llama.cpp is excluded: instrumenting ggml adds minutes and reports nothing about our code.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "MICROVLLM_SANITIZER": "address+undefined",
+        "MICROVLLM_BUILD_LLAMA": "OFF",
+        "MICROVLLM_BUILD_BENCHMARKS": "OFF"
+      }
+    },
+    {
+      "name": "wsl-tsan",
+      "inherits": "wsl-base",
+      "displayName": "WSL ThreadSanitizer",
+      "description": "The concurrency-correctness claim rests on this preset. Excludes llama.cpp so every report is necessarily first-party.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "MICROVLLM_SANITIZER": "thread",
+        "MICROVLLM_BUILD_LLAMA": "OFF",
+        "MICROVLLM_BUILD_BENCHMARKS": "OFF"
+      }
+    },
+    {
+      "name": "win-msvc",
+      "displayName": "Windows MSVC",
+      "description": "Cross-platform compile check only. Windows has no ThreadSanitizer, so this preset never validates concurrency.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    }
+  ],
+
+  "buildPresets": [
+    { "name": "wsl-debug",      "configurePreset": "wsl-debug" },
+    { "name": "wsl-release",    "configurePreset": "wsl-release" },
+    { "name": "wsl-asan-ubsan", "configurePreset": "wsl-asan-ubsan" },
+    { "name": "wsl-tsan",       "configurePreset": "wsl-tsan" },
+    { "name": "win-msvc",       "configurePreset": "win-msvc" }
+  ],
+
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    { "name": "wsl-debug",      "inherits": "base", "configurePreset": "wsl-debug" },
+    { "name": "wsl-release",    "inherits": "base", "configurePreset": "wsl-release" },
+    { "name": "wsl-asan-ubsan", "inherits": "base", "configurePreset": "wsl-asan-ubsan" },
+    { "name": "wsl-tsan",       "inherits": "base", "configurePreset": "wsl-tsan" },
+    { "name": "win-msvc",       "inherits": "base", "configurePreset": "win-msvc" }
+  ]
+}

@@ -1,0 +1,31 @@
+# Build output. The real build trees live on WSL native fs (see CMakePresets.json),
+# but keep these ignored in case anyone configures in-tree.
+build/
+out/
+cmake-build-*/
+_deps/
+
+# Model weights are large and fetched by scripts/fetch_model.sh
+models/
+*.gguf
+
+# Benchmark artifacts
+benchmarks/results/
+docs/charts/
+*.perf
+perf.data*
+
+# Editor / OS
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+*.swp
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

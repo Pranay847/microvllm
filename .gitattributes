@@ -1,0 +1,12 @@
+# The repo lives on an NTFS path but is built from WSL2. Normalize to LF everywhere so
+# the two toolchains do not fight over line endings.
+* text=auto eol=lf
+
+# Binary / model artifacts
+*.gguf   binary
+*.png    binary
+*.jpg    binary
+*.pdf    binary
+
+# Keep vendored third-party code out of language stats and diffs
+third_party/** linguist-vendored

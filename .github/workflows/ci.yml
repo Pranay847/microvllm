@@ -1,0 +1,86 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+jobs:
+  # Full build including the llama.cpp-backed engine. Proves the backend facade
+  # still compiles against the pinned submodule.
+  build:
+    name: build + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ccache
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-build-${{ github.sha }}
+          restore-keys: ccache-build-
+      - run: cmake --preset wsl-release
+      - run: cmake --build --preset wsl-release
+      - run: ctest --preset wsl-release
+      - run: ccache --show-stats
+
+  # Sanitizer jobs build first-party code only (MICROVLLM_BUILD_LLAMA=OFF via the
+  # presets) and run against the mock engine. No model is ever downloaded in CI.
+  sanitizers:
+    name: ${{ matrix.preset }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [wsl-asan-ubsan, wsl-tsan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+      - run: cmake --preset ${{ matrix.preset }}
+      - run: cmake --build --preset ${{ matrix.preset }}
+      - run: ctest --preset ${{ matrix.preset }}
+
+  # Races are probabilistic. A single green TSan run proves very little, so the
+  # concurrency suite is repeated -- this is the run the README's claim cites.
+  tsan-repeat:
+    name: tsan x25
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+      - run: cmake --preset wsl-tsan
+      - run: cmake --build --preset wsl-tsan
+      - name: Repeat concurrency suite
+        run: ctest --preset wsl-tsan --repeat until-fail:25
+
+  # Compile check only. Windows has no ThreadSanitizer; this job never validates
+  # concurrency and must not be cited as if it did.
+  windows:
+    name: msvc compile check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ilammy/msvc-dev-cmd@v1
+      - run: cmake --preset win-msvc
+      - run: cmake --build --preset win-msvc
