@@ -5,9 +5,11 @@ add_executable(microvllm_tests
     test_types.cpp
     test_mock_engine.cpp
     test_generator.cpp
+    test_http_api.cpp
 )
 target_link_libraries(microvllm_tests PRIVATE
     microvllm_core
+    microvllm_http_api
     GTest::gtest_main
 )
 

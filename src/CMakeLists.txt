@@ -39,12 +39,28 @@ if(MICROVLLM_BUILD_LLAMA)
 endif()
 
 # ---------------------------------------------------------------------------
+# microvllm_http_api -- the /generate request/response contract as pure
+# string<->value functions. JSON (nlohmann) is a private implementation detail, so
+# this logic is unit-tested without linking a socket library.
+# ---------------------------------------------------------------------------
+add_library(microvllm_http_api STATIC
+    http/http_api.cpp
+)
+target_link_libraries(microvllm_http_api
+    PUBLIC  microvllm_core
+    PRIVATE nlohmann_json::nlohmann_json)
+add_library(microvllm::http_api ALIAS microvllm_http_api)
+
+# ---------------------------------------------------------------------------
 # Server executable
 # ---------------------------------------------------------------------------
-add_executable(microvllm main.cpp)
+add_executable(microvllm
+    main.cpp
+    http/server.cpp
+)
 target_link_libraries(microvllm PRIVATE
     microvllm_core
-    nlohmann_json::nlohmann_json
+    microvllm_http_api
     httplib::httplib
 )
 if(MICROVLLM_BUILD_LLAMA)

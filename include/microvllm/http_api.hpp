@@ -1,0 +1,33 @@
+#pragma once
+
+#include <string>
+#include <string_view>
+
+#include "microvllm/types.hpp"
+
+// The request/response contract for POST /generate, as pure string<->value functions.
+// JSON is an implementation detail here (nlohmann/json lives in the .cpp), so this
+// header stays dependency-free and the parsing logic is unit-testable without a socket.
+
+namespace microvllm {
+
+// Thrown by parse_generate_request on malformed input; the message is safe to return
+// to the client as a 400 body.
+struct BadRequest : std::exception {
+    std::string message;
+    explicit BadRequest(std::string m) : message(std::move(m)) {}
+    [[nodiscard]] const char* what() const noexcept override { return message.c_str(); }
+};
+
+// Parse a POST /generate JSON body into a RequestSpec. Required: "prompt" (string).
+// Optional: "max_tokens" (uint), "temperature"/"top_p"/"top_k"/"seed" (sampling),
+// "stop" (string or array of strings). Throws BadRequest on anything malformed.
+RequestSpec parse_generate_request(std::string_view body);
+
+// Serialize a completed generation into the JSON response body.
+std::string make_generate_response(std::string_view text, FinishReason reason, const Usage& usage);
+
+// Serialize an error into a JSON body: {"error": message}.
+std::string make_error_response(std::string_view message);
+
+}  // namespace microvllm
