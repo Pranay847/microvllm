@@ -7,8 +7,9 @@
 namespace microvllm {
 
 struct ServerConfig {
-    std::string host = "0.0.0.0";
-    int         port = 8080;
+    std::string   host            = "0.0.0.0";
+    int           port            = 8080;
+    std::size_t   max_queue_depth = 64;  // reject with 503 beyond this many waiting requests
 };
 
 // Serve POST /generate and GET /health against `engine`, blocking until the process
