@@ -23,6 +23,7 @@ class MockModelEngine final : public IModelEngine {
 public:
     struct Config {
         std::string               response;              // text the model "generates"
+        bool                      echo_prompt = false;   // if set, each seq replays its own prompt
         std::chrono::microseconds token_latency{0};      // sleep per decode step
         std::uint32_t             n_ctx     = 4096;
         std::uint32_t             n_batch   = 512;
@@ -45,7 +46,8 @@ public:
 
 private:
     struct SeqState {
-        std::size_t gen_index = 0;  // how many response bytes emitted so far
+        std::size_t        gen_index = 0;  // how many response bytes emitted so far
+        std::vector<Token> echo;           // captured prompt (echo mode only)
     };
 
     Config                             config_;

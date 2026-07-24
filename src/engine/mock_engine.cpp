@@ -64,9 +64,20 @@ std::vector<GenStep> MockModelEngine::decode(std::span<const BatchItem> batch) {
         }
         SeqState& state = it->second;
 
-        if (state.gen_index < response_tokens_.size()) {
-            steps.push_back(GenStep{
-                .seq = item.seq, .token = response_tokens_[state.gen_index], .is_eog = false});
+        // Echo mode: the first decode of a sequence is its prefill, so capture the
+        // prompt (minus the BOS token) as this sequence's response.
+        if (config_.echo_prompt && state.gen_index == 0 && state.echo.empty()) {
+            for (const Token t : item.tokens) {
+                if (t != kBosToken) {
+                    state.echo.push_back(t);
+                }
+            }
+        }
+        const std::vector<Token>& response = config_.echo_prompt ? state.echo : response_tokens_;
+
+        if (state.gen_index < response.size()) {
+            steps.push_back(
+                GenStep{.seq = item.seq, .token = response[state.gen_index], .is_eog = false});
             ++state.gen_index;
         } else {
             steps.push_back(GenStep{.seq = item.seq, .token = kEosToken, .is_eog = true});

@@ -132,6 +132,46 @@ TEST(MockEngine, DecodeReturnsOneStepPerSamplingItem) {
     EXPECT_EQ(steps[0].seq, 1);
 }
 
+TEST(MockEngine, EchoModeReplaysThePromptAsOutput) {
+    // In echo mode the "response" is the sequence's own prompt (minus BOS). This is
+    // what lets the concurrency test verify each client gets its own result.
+    MockModelEngine eng(MockModelEngine::Config{.response = "", .echo_prompt = true});
+    eng.begin_sequence(0, SamplingParams{});
+
+    const auto prompt = eng.tokenize("Hi", /*add_special=*/true);  // [BOS,'H','i']
+    const BatchItem prefill{.seq = 0, .tokens = prompt, .pos0 = 0, .sample = true};
+    const BatchItem batch[] = {prefill};
+
+    auto s = eng.decode(batch);
+    ASSERT_EQ(s.size(), 1U);
+    EXPECT_EQ(s[0].token, static_cast<Token>('H'));  // first prompt byte, not a fixed response
+
+    Token t = s[0].token;
+    const GenStep s2 = step_one(eng, 0, &t, 10);
+    EXPECT_EQ(s2.token, static_cast<Token>('i'));
+
+    t = s2.token;
+    const GenStep s3 = step_one(eng, 0, &t, 11);
+    EXPECT_TRUE(s3.is_eog);  // prompt exhausted -> EOS
+}
+
+TEST(MockEngine, EchoModeKeepsSequencesDistinct) {
+    MockModelEngine eng(MockModelEngine::Config{.response = "", .echo_prompt = true});
+    eng.begin_sequence(1, SamplingParams{});
+    eng.begin_sequence(2, SamplingParams{});
+
+    const auto p1 = eng.tokenize("A", true);
+    const auto p2 = eng.tokenize("B", true);
+    const BatchItem b1{.seq = 1, .tokens = p1, .pos0 = 0, .sample = true};
+    const BatchItem b2{.seq = 2, .tokens = p2, .pos0 = 0, .sample = true};
+
+    const BatchItem batch1[] = {b1};
+    const BatchItem batch2[] = {b2};
+    EXPECT_EQ(eng.decode(batch1)[0].token, static_cast<Token>('A'));
+    EXPECT_EQ(eng.decode(batch2)[0].token, static_cast<Token>('B'))
+        << "each sequence echoes its own prompt";
+}
+
 TEST(MockEngine, ReleasedSequenceCanRestart) {
     auto eng = make("Q");
     eng.begin_sequence(0, SamplingParams{});
