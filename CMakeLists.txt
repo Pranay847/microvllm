@@ -101,7 +101,29 @@ if(MICROVLLM_BUILD_LLAMA)
     set(GGML_CCACHE          ON  CACHE BOOL "" FORCE)
     set(BUILD_SHARED_LIBS    OFF CACHE BOOL "" FORCE)
 
+    # Build llama.cpp at C++17, not our C++20.
+    #
+    # Upstream pins itself with `target_compile_features(llama PRIVATE cxx_std_17) # don't bump`,
+    # but CMAKE_CXX_STANDARD from this scope raises it to 20 anyway, and that combination is
+    # broken on MSVC:
+    #
+    #   llama-chat.cpp guards its char8_t workaround with `#if __cplusplus >= 202000L`.
+    #   MSVC reports __cplusplus as 199711L unless /Zc:__cplusplus is passed -- and we pass
+    #   that only to first-party targets. So llama.cpp takes the C++17 branch of the guard
+    #   while actually compiling as C++20, and every LU8("...") literal is a const char8_t*
+    #   where a const char* is expected.
+    #
+    # gcc reports __cplusplus honestly, so this is invisible on Linux and fails only on MSVC.
+    # Honouring upstream's declared standard fixes it at the source rather than papering over
+    # it by forcing /Zc:__cplusplus into third-party code. Mixing C++17 and C++20 objects is
+    # fine here: llama.cpp exports cxx_std_17 as a *minimum*, so our C++20 targets satisfy it.
+    set(_microvllm_parent_cxx_standard ${CMAKE_CXX_STANDARD})
+    set(CMAKE_CXX_STANDARD 17)
+
     add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL SYSTEM)
+
+    set(CMAKE_CXX_STANDARD ${_microvllm_parent_cxx_standard})
+    unset(_microvllm_parent_cxx_standard)
 endif()
 
 # ---------------------------------------------------------------------------
