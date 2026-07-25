@@ -84,9 +84,77 @@ against `llama-server` as an external reference.
 
 ---
 
+## Phase 3 — throughput vs. batch size (static batching)
+
+End-to-end through the HTTP server: 32 concurrent requests, 32 output tokens each, uniform
+length. `benchmarks/bench_batching.py`, 5 interleaved rounds after a discarded warm-up, one
+server process per arm, `--threads 8` throughout.
+
+| Batch size | Median tok/s | IQR | Speedup |
+|---:|---:|---:|---:|
+| 1  | 35.36 | 32.69 – 38.62 | 1.00× |
+| 4  | 55.25 | 42.38 – 57.90 | 1.56× |
+| 8  | 63.61 | 62.52 – 64.27 | 1.80× |
+| **16** | **72.84** | 72.05 – 73.09 | **2.06×** |
+| 32 | 56.85 | 56.59 – 61.23 | 1.61× |
+
+**Peak is 2.06× at batch size 16, and throughput *regresses* at 32.**
+
+### Reading the curve
+
+The gain is real but sublinear, and it is bounded by the same memory-bandwidth wall the
+Phase 0 thread sweep exposed. Batching amortises weight traffic — one pass over 463 MiB of
+weights advances every sequence in the batch instead of one — so throughput climbs steeply
+from 1 to 8. Past that, per-step overhead that does *not* amortise (attention over each
+sequence's own KV cache, sampling per sequence, the scheduler's own bookkeeping) grows
+linearly with batch size and starts to dominate.
+
+The regression at 32 is the more interesting half. Two effects compound:
+
+- **KV-cache pressure.** 32 sequences × 4096 context × ~12 KB/token of KV is a far larger
+  working set than 16, and it stops fitting the cache hierarchy the way smaller batches do.
+  This is precisely the resource Phase 5's block allocator exists to manage.
+- **Ragged completion.** Static batching holds the whole batch until its *last* member
+  finishes. With 32 sequences the odds that at least one runs long rise, and every finished
+  sequence's slot sits idle until then. Batch occupancy decays over the batch's lifetime, and
+  the wider the batch the more of it decays.
+
+Note the variance, too: batch 16 is the *tightest* arm (IQR 72.05–73.09, ~1.4% spread) while
+batch 1 is the loosest (32.69–38.62, ~17%). Serial execution is dominated by per-request
+overhead and scheduling jitter; a well-fed batch is dominated by steady memory traffic, which
+is far more reproducible.
+
+### The limitation this measures
+
+Uniform-length requests are static batching's **best case** — every sequence finishes on the
+same step, so no slot idles. The workload here was chosen that way deliberately, to isolate
+the batching gain from the batching *penalty*.
+
+Real traffic is mixed-length, and that is where static batching breaks down: a 16-token
+request batched with a 512-token one occupies its slot for all 512 steps, producing nothing
+for 496 of them. Phase 4's continuous batching retires finished sequences and admits waiting
+ones every step, so that slot goes back to work immediately. The mixed-length comparison
+between the two is the project's headline measurement, and this table is its control arm.
+
+### A crash the benchmark found
+
+The first run of this sweep returned zeros for the entire `bs=32` arm — every request refused.
+The server was not slow, it was **dying**: `LlamaEngineConfig::n_seq_max` defaults to 16, and
+submitting a batch with more sequences than the context was built for makes llama.cpp abort
+the process. Fixed in two places: `main` now sizes the context to the requested batch, and the
+scheduler clamps `max_batch_size` to `engine.caps().n_seq_max` regardless, on the principle
+that no command-line value should be able to abort the server. Both are pinned by regression
+tests.
+
+The 60-test unit suite could not have caught this — the mock engine's sequence capacity was
+never exceeded. It took a real model at a real batch size, which is the argument for
+benchmarking against the real backend rather than trusting the mock alone.
+
+---
+
 ## Planned measurements
 
-- **Phase 3** — throughput vs. batch size (1/4/8/16/32), locating the plateau
+- ~~**Phase 3** — throughput vs. batch size (1/4/8/16/32), locating the plateau~~ ✅ above
 - **Phase 4** — continuous vs. static under mixed load (80% short 16–32 tokens, 20% long
   256–512): throughput, TTFT and TPOT percentiles, plus Poisson arrivals swept to the latency knee
 - **Phase 5** — KV utilization and preemption counts under a constrained `--kv-blocks` budget;
