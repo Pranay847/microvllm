@@ -96,4 +96,22 @@ std::string make_error_response(std::string_view message) {
     return j.dump();
 }
 
+std::string make_stream_delta(std::string_view delta) {
+    const json j = {{"text", delta}};
+    return j.dump();
+}
+
+std::string make_stream_done(FinishReason reason, const Usage& usage) {
+    const json j = {
+        {"finish_reason", to_string(reason)},
+        {"usage",
+         {
+             {"prompt_tokens", usage.prompt_tokens},
+             {"completion_tokens", usage.completion_tokens},
+             {"total_tokens", usage.total_tokens()},
+         }},
+    };
+    return j.dump();
+}
+
 }  // namespace microvllm

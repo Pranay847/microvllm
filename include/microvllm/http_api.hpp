@@ -30,4 +30,10 @@ std::string make_generate_response(std::string_view text, FinishReason reason, c
 // Serialize an error into a JSON body: {"error": message}.
 std::string make_error_response(std::string_view message);
 
+// One incremental chunk of a streamed response: {"text": delta}.
+std::string make_stream_delta(std::string_view delta);
+
+// The final event of a streamed response, carrying the reason and usage totals.
+std::string make_stream_done(FinishReason reason, const Usage& usage);
+
 }  // namespace microvllm
