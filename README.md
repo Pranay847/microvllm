@@ -5,10 +5,11 @@ serving engines fast under concurrent load — **continuous batching**, **reques
 and a **block-based KV-cache allocator with admission control** — around llama.cpp as the
 tensor backend.
 
-> **Status: Phase 2 complete.** A concurrent HTTP server generates real text end to end:
-> HTTP threads enqueue onto a bounded queue, a single engine thread runs the model, results
-> return by promise/future, with 503 backpressure, client-disconnect cancellation, and graceful
-> SIGINT drain. Continuous batching and the paged KV-cache allocator land in Phases 3–5. See
+> **Status: Phase 3 complete.** A concurrent HTTP server serves a real model with **static
+> batching** — multiple sequences packed into one forward pass, measured at **2.06× the
+> single-sequence throughput** at batch size 16
+> ([benchmarks](docs/benchmarks.md#phase-3--throughput-vs-batch-size-static-batching)).
+> Continuous batching (Phase 4) and the paged KV-cache allocator (Phase 5) are next. See
 > [docs/architecture.md](docs/architecture.md) for the design.
 
 ## What this is, and what it isn't

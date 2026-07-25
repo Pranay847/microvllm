@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +29,7 @@ struct Args {
     bool         mock_echo = false;  // mock echoes each prompt (for load-test matching)
     bool         quiet     = false;
     std::size_t  queue_depth = 64;
+    std::size_t  batch_size  = 8;
 };
 
 [[noreturn]] void usage(const char* prog, int code) {
@@ -45,6 +47,7 @@ struct Args {
                  "  --mock <text>     serve a deterministic mock engine instead of a model\n"
                  "  --mock-echo       mock mode that echoes each prompt back (load testing)\n"
                  "  --queue <n>       max waiting requests before 503 (default 64)\n"
+                 "  --batch-size <n>  sequences batched into one forward pass (default 8)\n"
                  "  --quiet           silence llama.cpp info logging\n"
                  "  --help\n",
                  microvllm::kVersion, prog, prog);
@@ -81,6 +84,12 @@ Args parse_args(int argc, char** argv) {
             a.has_mock  = true;
         } else if (std::strcmp(arg, "--queue") == 0) {
             a.queue_depth = static_cast<std::size_t>(std::atoi(need_value(argc, argv, i, argv[0])));
+        } else if (std::strcmp(arg, "--batch-size") == 0) {
+            a.batch_size = static_cast<std::size_t>(std::atoi(need_value(argc, argv, i, argv[0])));
+            if (a.batch_size == 0) {
+                std::fprintf(stderr, "error: --batch-size must be >= 1\n");
+                usage(argv[0], 2);
+            }
         } else if (std::strcmp(arg, "--quiet") == 0) {
             a.quiet = true;
         } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
@@ -101,8 +110,10 @@ Args parse_args(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     const Args args = parse_args(argc, argv);
-    const microvllm::ServerConfig server_cfg{
-        .host = args.host, .port = args.port, .max_queue_depth = args.queue_depth};
+    const microvllm::ServerConfig server_cfg{.host            = args.host,
+                                             .port            = args.port,
+                                             .max_queue_depth = args.queue_depth,
+                                             .max_batch_size  = args.batch_size};
 
     if (args.has_mock) {
         std::printf("microvllm %s (mock engine%s)\n", microvllm::kVersion,
@@ -124,6 +135,10 @@ int main(int argc, char** argv) {
         cfg.model_path = args.model;
         cfg.n_ctx      = args.n_ctx;
         cfg.n_threads  = args.threads;
+        // The context must be built to hold as many sequences as the scheduler will
+        // batch; otherwise llama.cpp aborts the process on the first oversized batch.
+        cfg.n_seq_max  = static_cast<std::uint32_t>(
+            std::max<std::size_t>(args.batch_size, cfg.n_seq_max));
         microvllm::LlamaModelEngine engine(cfg);
         return microvllm::serve(engine, server_cfg) ? 0 : 1;
     } catch (const std::exception& e) {

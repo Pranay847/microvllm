@@ -7,7 +7,8 @@ add_executable(microvllm_tests
     test_generator.cpp
     test_http_api.cpp
     test_request_queue.cpp
-    test_engine_worker.cpp
+    test_scheduler.cpp
+    test_scheduler_serial.cpp
     test_concurrency.cpp
 )
 target_link_libraries(microvllm_tests PRIVATE

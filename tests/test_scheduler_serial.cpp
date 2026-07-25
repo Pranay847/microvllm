@@ -1,4 +1,8 @@
-#include "microvllm/engine_worker.hpp"
+// Scheduler with max_batch_size == 1: the serial path that Phase 2's EngineWorker used
+// to own. These tests are kept as a distinct suite because batch-size-1 is the baseline
+// every throughput measurement is compared against -- if batching ever silently broke the
+// degenerate case, the benchmark's control arm would be measuring the wrong thing.
+#include "microvllm/scheduler.hpp"
 
 #include <gtest/gtest.h>
 
@@ -13,6 +17,8 @@
 namespace microvllm {
 namespace {
 
+constexpr SchedulerConfig kSerial{.max_batch_size = 1};
+
 Request make_req(RequestId id, std::string prompt,
                  std::shared_ptr<std::atomic<bool>> cancel = nullptr) {
     Request r;
@@ -23,11 +29,11 @@ Request make_req(RequestId id, std::string prompt,
     return r;
 }
 
-TEST(EngineWorker, FulfillsPromiseWithEchoedResult) {
+TEST(SchedulerSerial, FulfillsPromiseWithEchoedResult) {
     MockModelEngine engine(MockModelEngine::Config{.response = "", .echo_prompt = true});
     RequestQueue    queue(16);
-    EngineWorker    worker(engine, queue);
-    std::thread     t([&] { worker.run(); });
+    Scheduler       sched(engine, queue, kSerial);
+    std::thread     t([&] { sched.run(); });
 
     Request r   = make_req(1, "hello");
     auto    fut = r.result.get_future();
@@ -42,11 +48,11 @@ TEST(EngineWorker, FulfillsPromiseWithEchoedResult) {
     EXPECT_EQ(res.usage.completion_tokens, 5U);
 }
 
-TEST(EngineWorker, ProcessesManyRequestsEachWithItsOwnResult) {
+TEST(SchedulerSerial, ProcessesManyRequestsEachWithItsOwnResult) {
     MockModelEngine engine(MockModelEngine::Config{.response = "", .echo_prompt = true});
     RequestQueue    queue(64);
-    EngineWorker    worker(engine, queue);
-    std::thread     t([&] { worker.run(); });
+    Scheduler       sched(engine, queue, kSerial);
+    std::thread     t([&] { sched.run(); });
 
     std::vector<std::future<GenResult>> futures;
     std::vector<std::string>            prompts;
@@ -62,11 +68,10 @@ TEST(EngineWorker, ProcessesManyRequestsEachWithItsOwnResult) {
     t.join();
 
     for (std::size_t i = 0; i < futures.size(); ++i) {
-        EXPECT_EQ(futures[i].get().text, prompts[i]) << "result " << i << " must match its own request";
+        EXPECT_EQ(futures[i].get().text, prompts[i]) << "result " << i << " must match its request";
     }
 }
 
-// Engine that fails on decode, to prove the worker never leaves a promise unfulfilled.
 struct ThrowingEngine final : IModelEngine {
     [[nodiscard]] EngineCaps caps() const override { return EngineCaps{4096, 512, 16, -1}; }
     [[nodiscard]] std::vector<Token> tokenize(std::string_view, bool) override {
@@ -81,11 +86,11 @@ struct ThrowingEngine final : IModelEngine {
     int released = 0;
 };
 
-TEST(EngineWorker, FulfillsPromiseOnEngineError) {
+TEST(SchedulerSerial, FulfillsPromiseOnEngineError) {
     ThrowingEngine engine;
     RequestQueue   queue(4);
-    EngineWorker   worker(engine, queue);
-    std::thread    t([&] { worker.run(); });
+    Scheduler      sched(engine, queue, kSerial);
+    std::thread    t([&] { sched.run(); });
 
     Request r   = make_req(1, "x");
     auto    fut = r.result.get_future();
@@ -100,16 +105,16 @@ TEST(EngineWorker, FulfillsPromiseOnEngineError) {
     EXPECT_GT(engine.released, 0) << "the dirty KV slot must be cleared after a failure";
 }
 
-TEST(EngineWorker, HonorsCancellation) {
+TEST(SchedulerSerial, HonorsCancellation) {
     MockModelEngine engine(MockModelEngine::Config{.response = "", .echo_prompt = true});
     RequestQueue    queue(4);
-    EngineWorker    worker(engine, queue);
+    Scheduler       sched(engine, queue, kSerial);
 
     auto    cancel = std::make_shared<std::atomic<bool>>(true);  // already cancelled
     Request r      = make_req(1, "abcdefgh", cancel);
     auto    fut    = r.result.get_future();
 
-    std::thread t([&] { worker.run(); });
+    std::thread t([&] { sched.run(); });
     ASSERT_TRUE(queue.try_push(r));
     queue.close();
     t.join();

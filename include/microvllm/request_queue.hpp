@@ -29,6 +29,12 @@ public:
     // queue is closed and drained. Intended for the single consumer thread.
     [[nodiscard]] std::optional<Request> pop();
 
+    // Take a request if one is waiting, otherwise return immediately. The scheduler
+    // uses this to fill a batch: it blocks once via pop() for the first request, then
+    // try_pop()s to sweep up whatever else has already arrived without waiting for a
+    // batch to fill -- so a lone request is never delayed hoping for company.
+    [[nodiscard]] std::optional<Request> try_pop();
+
     // Stop accepting new requests and wake the consumer. Already-queued requests remain
     // poppable so the consumer can drain them; pop() returns nullopt once empty.
     void close();
