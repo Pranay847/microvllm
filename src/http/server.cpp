@@ -11,10 +11,10 @@
 #include <thread>
 
 #include "microvllm/collecting_sink.hpp"
-#include "microvllm/engine_worker.hpp"
 #include "microvllm/generator.hpp"
 #include "microvllm/http_api.hpp"
 #include "microvllm/request_queue.hpp"
+#include "microvllm/scheduler.hpp"
 
 namespace microvllm {
 namespace {
@@ -31,8 +31,8 @@ extern "C" void on_signal(int) { g_signal_received.store(true, std::memory_order
 
 bool serve(IModelEngine& engine, const ServerConfig& config) {
     RequestQueue queue(config.max_queue_depth);
-    EngineWorker worker(engine, queue);
-    std::thread  worker_thread([&] { worker.run(); });
+    Scheduler    scheduler(engine, queue, SchedulerConfig{.max_batch_size = config.max_batch_size});
+    std::thread  worker_thread([&] { scheduler.run(); });
 
     httplib::Server server;
     std::atomic<std::uint64_t> next_id{1};

@@ -1,7 +1,7 @@
 // The concurrency-correctness suite. Its whole reason to exist is to be run under
 // ThreadSanitizer (the wsl-tsan preset, repeated in CI), so it hammers the exact shared
 // surface of the server -- the RequestQueue and the per-request cancel flags -- from
-// many threads against a single EngineWorker.
+// many threads against a single Scheduler thread.
 //
 // It uses the mock engine, so a report here is necessarily a first-party data race.
 #include <atomic>
@@ -14,8 +14,8 @@
 
 #include <gtest/gtest.h>
 
-#include "microvllm/engine_worker.hpp"
 #include "microvllm/mock_engine.hpp"
+#include "microvllm/scheduler.hpp"
 
 namespace microvllm {
 namespace {
@@ -38,8 +38,10 @@ TEST(Concurrency, ManyProducersSingleWorkerEveryResultMatches) {
 
     MockModelEngine engine(MockModelEngine::Config{.response = "", .echo_prompt = true});
     RequestQueue    queue(16);  // small on purpose: producers will be rejected and retry
-    EngineWorker    worker(engine, queue);
-    std::thread     worker_thread([&] { worker.run(); });
+    // Batching on: the scheduler now races producers while forming batches out of the
+    // queue, so this exercises pop()/try_pop() interleaving as well as push contention.
+    Scheduler   worker(engine, queue, SchedulerConfig{.max_batch_size = 8});
+    std::thread worker_thread([&] { worker.run(); });
 
     struct Pending {
         std::string             prompt;
@@ -91,7 +93,7 @@ TEST(Concurrency, ConcurrentCancellationIsRaceFree) {
         .response = "abcdefghijklmnop", .echo_prompt = false,
         .token_latency = std::chrono::microseconds(20)});  // a window for cancels to land
     RequestQueue queue(kRequests);
-    EngineWorker worker(engine, queue);
+    Scheduler    worker(engine, queue, SchedulerConfig{.max_batch_size = 8});
     std::thread  worker_thread([&] { worker.run(); });
 
     std::vector<std::shared_ptr<std::atomic<bool>>> cancels;
@@ -137,7 +139,7 @@ TEST(Concurrency, ConcurrentCancellationIsRaceFree) {
 TEST(Concurrency, CloseDuringProductionLosesNothingAccepted) {
     MockModelEngine engine(MockModelEngine::Config{.response = "", .echo_prompt = true});
     RequestQueue    queue(64);
-    EngineWorker    worker(engine, queue);
+    Scheduler       worker(engine, queue, SchedulerConfig{.max_batch_size = 8});
     std::thread     worker_thread([&] { worker.run(); });
 
     std::mutex                          accepted_mu;

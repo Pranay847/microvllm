@@ -9,8 +9,9 @@
 add_library(microvllm_core STATIC
     core/types.cpp
     core/generator.cpp
+    core/sequence_state.cpp
     core/request_queue.cpp
-    core/engine_worker.cpp
+    core/scheduler.cpp
     engine/mock_engine.cpp
 )
 target_link_libraries(microvllm_core PUBLIC microvllm_options)

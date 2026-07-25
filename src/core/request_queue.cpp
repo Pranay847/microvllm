@@ -27,6 +27,16 @@ std::optional<Request> RequestQueue::pop() {
     return req;
 }
 
+std::optional<Request> RequestQueue::try_pop() {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (queue_.empty()) {
+        return std::nullopt;
+    }
+    Request req = std::move(queue_.front());
+    queue_.pop_front();
+    return req;
+}
+
 void RequestQueue::close() {
     {
         const std::lock_guard<std::mutex> lock(mutex_);
