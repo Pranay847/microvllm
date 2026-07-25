@@ -15,6 +15,7 @@
 #include "microvllm/http_api.hpp"
 #include "microvllm/request_queue.hpp"
 #include "microvllm/scheduler.hpp"
+#include "microvllm/streaming_sink.hpp"
 
 namespace microvllm {
 namespace {
@@ -31,7 +32,10 @@ extern "C" void on_signal(int) { g_signal_received.store(true, std::memory_order
 
 bool serve(IModelEngine& engine, const ServerConfig& config) {
     RequestQueue queue(config.max_queue_depth);
-    Scheduler    scheduler(engine, queue, SchedulerConfig{.max_batch_size = config.max_batch_size});
+    Scheduler    scheduler(engine, queue,
+                           SchedulerConfig{.max_batch_size = config.max_batch_size,
+                                           .mode           = config.mode,
+                                           .prefill_chunk  = config.prefill_chunk});
     std::thread  worker_thread([&] { scheduler.run(); });
 
     httplib::Server server;
@@ -51,6 +55,10 @@ bool serve(IModelEngine& engine, const ServerConfig& config) {
             res.set_content(make_error_response(e.message), kJson);
             return;
         }
+
+        // Note: context-length admission control happens on the scheduler thread, which
+        // owns the engine. Tokenizing here to pre-check would race with generation --
+        // IModelEngine is single-threaded by contract.
 
         // Keep a copy of the cancel flag and the future: `r` is moved into the queue.
         auto    cancel = std::make_shared<std::atomic<bool>>(false);
@@ -75,12 +83,81 @@ bool serve(IModelEngine& engine, const ServerConfig& config) {
         }
 
         const GenResult result = fut.get();
+        if (result.reason == FinishReason::kContextOverflow) {
+            res.status = 400;  // the client asked for more than the context can hold
+            res.set_content(make_error_response(result.error), kJson);
+            return;
+        }
         if (result.reason == FinishReason::kError) {
             res.status = 500;
             res.set_content(make_error_response(result.error), kJson);
             return;
         }
         res.set_content(make_generate_response(result.text, result.reason, result.usage), kJson);
+    });
+
+    // POST /generate/stream -- Server-Sent Events, one event per text delta.
+    //
+    // This is what the Phase 1 ITokenSink abstraction was for: the generator already
+    // streams text deltas with stop strings correctly withheld, so streaming needed no
+    // change to the scheduler, generator, or engine -- only a different sink.
+    server.Post("/generate/stream", [&](const httplib::Request& req, httplib::Response& res) {
+        RequestSpec spec;
+        try {
+            spec = parse_generate_request(req.body);
+        } catch (const BadRequest& e) {
+            res.status = 400;
+            res.set_content(make_error_response(e.message), kJson);
+            return;
+        }
+
+        auto cancel = std::make_shared<std::atomic<bool>>(false);
+        auto sink   = std::make_shared<StreamingSink>(cancel);
+
+        Request r;
+        r.id     = next_id.fetch_add(1, std::memory_order_relaxed);
+        r.spec   = std::move(spec);
+        r.cancel = cancel;
+        r.sink   = sink;
+        std::future<GenResult> fut = r.result.get_future();
+
+        if (!queue.try_push(r)) {
+            res.status = 503;
+            res.set_content(make_error_response("server at capacity; retry later"), kJson);
+            return;
+        }
+
+        // Keep the future alive for the provider's lifetime so the scheduler always has
+        // somewhere to put the result, even if the client vanishes mid-stream.
+        auto shared_fut = std::make_shared<std::future<GenResult>>(std::move(fut));
+
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [sink, cancel, shared_fut, &shutting_down](std::size_t, httplib::DataSink& out) {
+                const StreamingSink::Event ev = sink->next();  // blocks for the next delta
+
+                if (!ev.terminal) {
+                    const std::string chunk = "data: " + make_stream_delta(ev.text) + "\n\n";
+                    if (!out.write(chunk.data(), chunk.size())) {
+                        cancel->store(true, std::memory_order_relaxed);  // client hung up
+                        return false;
+                    }
+                    // A disconnect is often only visible on the *next* write, so also
+                    // honour a server drain here rather than streaming into the void.
+                    if (shutting_down.load(std::memory_order_relaxed)) {
+                        cancel->store(true, std::memory_order_relaxed);
+                    }
+                    return true;
+                }
+
+                const std::string body = ev.reason == FinishReason::kError
+                                             ? make_error_response(ev.error)
+                                             : make_stream_done(ev.reason, ev.usage);
+                const std::string tail = "data: " + body + "\n\ndata: [DONE]\n\n";
+                out.write(tail.data(), tail.size());
+                out.done();
+                return false;  // stream complete
+            });
     });
 
     // Turn SIGINT/SIGTERM into a graceful stop. The watcher thread polls the flag the

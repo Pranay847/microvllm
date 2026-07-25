@@ -152,10 +152,98 @@ benchmarking against the real backend rather than trusting the mock alone.
 
 ---
 
+## Phase 4 — continuous vs. static batching under mixed load
+
+The measurement this project exists to make.
+
+Phase 3's uniform-length workload is static batching's best case: every sequence finishes on
+the same step, so no slot idles. Real traffic is mixed, and that is where holding a batch
+until its longest member finishes costs you. Workload here is **80% short (16–32 tokens),
+20% long (256–512)** — roughly the shape of chat traffic — identical across both arms.
+
+40 requests, concurrency 16, batch size 8, `--threads 8`. 3 interleaved rounds after a
+discarded warm-up. `benchmarks/bench_continuous.py`.
+
+| Metric | Static | Continuous | Change |
+|---|---:|---:|---|
+| **Short-request p50 latency** | 21.44 s | **8.51 s** | **−60%** (2.5× faster) |
+| **Short-request p95 latency** | 30.90 s | **13.24 s** | **−57%** |
+| **Short-request p99 latency** | 30.90 s | **16.40 s** | **−47%** |
+| Long-request p50 latency | 21.44 s | 47.12 s | **+120% (worse)** |
+| Throughput | 54.70 tok/s | 53.84 tok/s | 0.98× |
+| Wall clock | 63.49 s | 64.50 s | −2% |
+
+IQRs are tight (short p50: 20.93–22.07 static, 8.43–9.54 continuous), so the latency
+separation is far larger than the run-to-run noise.
+
+### What this actually shows — and what it doesn't
+
+**Continuous batching is a fairness win here, not a throughput win.** Throughput is flat
+(0.98×). That is not a disappointing result, it is the expected one, and the Phase 0 thread
+sweep already explained why: this machine is memory-bandwidth-bound during decode. The engine
+was already saturated at batch 8. Continuous batching does not create bandwidth that does not
+exist — the total work is the same, so the total time is the same.
+
+What changes is **who waits**. Under static batching every request in a batch finishes when
+the *slowest* one does, so a 20-token request sharing a batch with a 500-token request pays
+the long request's latency: short and long p50 are identical at 21.44 s, which is the
+signature of lockstep. Under continuous batching a short request retires the moment it is
+done and its slot is refilled, so short p50 drops to 8.51 s.
+
+**The cost is real and is reported here deliberately: long requests get 120% slower.** Once
+short requests stop queueing behind long ones, they instead run *alongside* them, so a long
+request now shares the engine with a continuous stream of new arrivals rather than a fixed
+cohort that drains. Continuous batching reallocates latency from the many to the few. That is
+the right trade for interactive serving — short requests are the overwhelming majority, and
+tail latency on them is what a user feels — but it is a trade, not a free lunch.
+
+The throughput gain in this project came in **Phase 3** (2.06× from batching at all). Phase 4
+buys latency fairness on top of it. Conflating the two would overstate the result.
+
+### Where the gap would widen
+
+Two conditions would make continuous batching win on throughput too, neither of which holds
+on this hardware:
+
+- **Compute-bound decode** (a GPU, or a much smaller model relative to memory bandwidth),
+  where an idle slot is genuinely wasted capacity rather than spare bandwidth.
+- **A queue deeper than the batch**, so freed slots are refilled instantly from a backlog. At
+  concurrency 16 with batch 8 there is some backlog, but not enough to keep every reclaimed
+  slot continuously busy.
+
+### Two bugs the real model exposed
+
+Neither could be caught by the mock-engine test suite, which is the argument for benchmarking
+against the real backend.
+
+**HTTP 500s under mixed load.** The first mixed-load run failed 5 of 12 requests. The server
+log showed `llama_kv_cache: size = 48.00 MiB (256 cells, 24 layers, 16/16 seqs)` followed by
+`decode: failed to find a memory slot for batch of size 8`. llama.cpp **divides** `n_ctx`
+across `n_seq_max`, so `--ctx 4096` with 16 sequences gives each request only **256**
+positions, and any request asking for 512 tokens could never complete. Raising `--batch-size`
+was silently shrinking every request's usable context.
+
+Fixed three ways: `--ctx` now means per-request context and the pool is sized as
+`n_ctx × n_seq_max`; `EngineCaps` exposes `n_ctx_seq` (queried via `llama_n_ctx_seq()`, since
+llama.h warns actual values may differ from requested); and the scheduler performs **admission
+control**, rejecting an oversized request immediately with `400` and a message naming the real
+limit, instead of admitting it and failing deep in the backend after the prefill compute has
+already been spent.
+
+**A data race, caught before it shipped.** The first version of that admission check ran in
+the HTTP handler and called `engine.tokenize()` — but the engine belongs to the scheduler
+thread, and `IModelEngine` is single-threaded by contract. Moved to the scheduler, which owns
+the engine and already tokenizes each request. ThreadSanitizer would have caught it; it should
+not have had to.
+
+---
+
 ## Planned measurements
 
 - ~~**Phase 3** — throughput vs. batch size (1/4/8/16/32), locating the plateau~~ ✅ above
-- **Phase 4** — continuous vs. static under mixed load (80% short 16–32 tokens, 20% long
-  256–512): throughput, TTFT and TPOT percentiles, plus Poisson arrivals swept to the latency knee
+- ~~**Phase 4** — continuous vs. static under mixed load~~ ✅ above
 - **Phase 5** — KV utilization and preemption counts under a constrained `--kv-blocks` budget;
   TTFT with and without prefix sharing
+- **Deferred** — TTFT and inter-token-latency percentiles need the streaming endpoint to be
+  measured client-side, and Poisson arrival sweeps need a load generator that models arrival
+  rate rather than fixed concurrency. Both are worth doing; neither changes the comparison above.

@@ -30,6 +30,8 @@ struct Args {
     bool         quiet     = false;
     std::size_t  queue_depth = 64;
     std::size_t  batch_size  = 8;
+    std::size_t  prefill_chunk = 128;
+    microvllm::BatchingMode mode = microvllm::BatchingMode::kContinuous;
 };
 
 [[noreturn]] void usage(const char* prog, int code) {
@@ -43,11 +45,14 @@ struct Args {
                  "  --host <addr>     bind address (default 0.0.0.0)\n"
                  "  --port <n>        bind port (default 8080)\n"
                  "  --threads <n>     inference threads (default 8)\n"
-                 "  --ctx <n>         context length (default 4096)\n"
+                 "  --ctx <n>         per-request context length (default 4096)\n"
                  "  --mock <text>     serve a deterministic mock engine instead of a model\n"
                  "  --mock-echo       mock mode that echoes each prompt back (load testing)\n"
                  "  --queue <n>       max waiting requests before 503 (default 64)\n"
                  "  --batch-size <n>  sequences batched into one forward pass (default 8)\n"
+                 "  --scheduler <m>   continuous (default) | static\n"
+                 "  --prefill-chunk <n>  prompt tokens per sequence per step (default 128,\n"
+                 "                    0 = submit whole prompts; continuous mode only)\n"
                  "  --quiet           silence llama.cpp info logging\n"
                  "  --help\n",
                  microvllm::kVersion, prog, prog);
@@ -90,6 +95,19 @@ Args parse_args(int argc, char** argv) {
                 std::fprintf(stderr, "error: --batch-size must be >= 1\n");
                 usage(argv[0], 2);
             }
+        } else if (std::strcmp(arg, "--scheduler") == 0) {
+            const char* m = need_value(argc, argv, i, argv[0]);
+            if (std::strcmp(m, "continuous") == 0) {
+                a.mode = microvllm::BatchingMode::kContinuous;
+            } else if (std::strcmp(m, "static") == 0) {
+                a.mode = microvllm::BatchingMode::kStatic;
+            } else {
+                std::fprintf(stderr, "error: --scheduler must be 'continuous' or 'static'\n");
+                usage(argv[0], 2);
+            }
+        } else if (std::strcmp(arg, "--prefill-chunk") == 0) {
+            a.prefill_chunk =
+                static_cast<std::size_t>(std::atoi(need_value(argc, argv, i, argv[0])));
         } else if (std::strcmp(arg, "--quiet") == 0) {
             a.quiet = true;
         } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
@@ -113,7 +131,9 @@ int main(int argc, char** argv) {
     const microvllm::ServerConfig server_cfg{.host            = args.host,
                                              .port            = args.port,
                                              .max_queue_depth = args.queue_depth,
-                                             .max_batch_size  = args.batch_size};
+                                             .max_batch_size  = args.batch_size,
+                                             .mode            = args.mode,
+                                             .prefill_chunk   = args.prefill_chunk};
 
     if (args.has_mock) {
         std::printf("microvllm %s (mock engine%s)\n", microvllm::kVersion,
@@ -139,6 +159,11 @@ int main(int argc, char** argv) {
         // batch; otherwise llama.cpp aborts the process on the first oversized batch.
         cfg.n_seq_max  = static_cast<std::uint32_t>(
             std::max<std::size_t>(args.batch_size, cfg.n_seq_max));
+        // llama.cpp divides the KV pool across sequences, so its n_ctx is a TOTAL and
+        // each sequence gets n_ctx / n_seq_max. --ctx means what a user expects it to
+        // mean -- the context available to one request -- so scale it up here. Without
+        // this, raising --batch-size silently shrinks every request's usable context.
+        cfg.n_ctx      = args.n_ctx * cfg.n_seq_max;
         microvllm::LlamaModelEngine engine(cfg);
         return microvllm::serve(engine, server_cfg) ? 0 : 1;
     } catch (const std::exception& e) {

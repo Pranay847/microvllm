@@ -10,6 +10,7 @@ const char* to_string(FinishReason r) noexcept {
         case FinishReason::kStopString: return "stop_string";
         case FinishReason::kCancelled:  return "cancelled";
         case FinishReason::kError:      return "error";
+        case FinishReason::kContextOverflow: return "context_overflow";
     }
     return "unknown";
 }

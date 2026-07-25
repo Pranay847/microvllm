@@ -16,6 +16,12 @@ struct EngineCaps {
     std::uint32_t n_batch   = 0;  // max tokens in one llama_decode call
     std::uint32_t n_seq_max = 0;  // max concurrent sequences
     Token         eos       = -1; // primary end-of-sequence token (informational)
+
+    // Positions available to a SINGLE sequence -- the real limit on prompt + completion
+    // length. llama.cpp divides the KV pool across n_seq_max, so this is typically
+    // n_ctx / n_seq_max and NOT n_ctx. Mixing the two up means a request that looks like
+    // it fits gets rejected deep inside the backend with an opaque decode failure.
+    std::uint32_t n_ctx_seq = 0;
 };
 
 // One sequence's contribution to a single decode step.

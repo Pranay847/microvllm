@@ -3,14 +3,17 @@
 #include <string>
 
 #include "microvllm/model_engine.hpp"
+#include "microvllm/scheduler.hpp"
 
 namespace microvllm {
 
 struct ServerConfig {
-    std::string   host            = "0.0.0.0";
-    int           port            = 8080;
-    std::size_t   max_queue_depth = 64;  // reject with 503 beyond this many waiting requests
-    std::size_t   max_batch_size  = 8;   // sequences packed into one forward pass
+    std::string  host            = "0.0.0.0";
+    int          port            = 8080;
+    std::size_t  max_queue_depth = 64;  // reject with 503 beyond this many waiting requests
+    std::size_t  max_batch_size  = 8;   // sequences packed into one forward pass
+    BatchingMode mode            = BatchingMode::kContinuous;
+    std::size_t  prefill_chunk   = 128;  // prompt tokens one sequence may submit per step
 };
 
 // Serve POST /generate and GET /health against `engine`, blocking until the process

@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 
+#include "microvllm/token_sink.hpp"
 #include "microvllm/types.hpp"
 
 namespace microvllm {
@@ -28,6 +29,12 @@ struct Request {
     RequestSpec                        spec;
     std::shared_ptr<std::atomic<bool>> cancel;  // never null once submitted
     std::promise<GenResult>            result;
+
+    // Where generated text goes as it is produced. Null means "buffer it" -- the
+    // scheduler installs a CollectingSink and the whole response arrives via `result`.
+    // The streaming endpoint supplies a StreamingSink so the HTTP thread can write SSE
+    // events while generation is still running.
+    std::shared_ptr<ITokenSink> sink;
 
     Request() = default;
     Request(Request&&) noexcept            = default;
