@@ -47,8 +47,23 @@ Pos SequenceState::feed_pos() const {
     return static_cast<Pos>(prompt_.size()) + static_cast<Pos>(usage_.completion_tokens) - 1;
 }
 
-BatchItem SequenceState::prefill_item() const {
-    return BatchItem{.seq = seq_, .tokens = prompt_, .pos0 = 0, .sample = true};
+std::size_t SequenceState::prefill_remaining() const {
+    return prompt_.size() - prefilled_;
+}
+
+BatchItem SequenceState::take_prefill_chunk(std::size_t budget) {
+    const std::size_t take = std::min(budget, prefill_remaining());
+    const std::size_t from = prefilled_;
+    prefilled_ += take;
+
+    // Only the chunk that completes the prompt asks the engine for a token; earlier
+    // chunks exist purely to populate this sequence's KV cache.
+    return BatchItem{
+        .seq    = seq_,
+        .tokens = std::span<const Token>(prompt_).subspan(from, take),
+        .pos0   = static_cast<Pos>(from),
+        .sample = prefill_remaining() == 0,
+    };
 }
 
 BatchItem SequenceState::decode_item() const {
@@ -111,9 +126,9 @@ bool SequenceState::accept(IModelEngine& engine, const GenStep& step) {
     return true;
 }
 
-void SequenceState::fail(std::string message) {
+void SequenceState::fail(std::string message, FinishReason reason) {
     error_ = std::move(message);
-    stop_with(FinishReason::kError);
+    stop_with(reason);
 }
 
 void SequenceState::finish() {
@@ -123,7 +138,7 @@ void SequenceState::finish() {
     notified_ = true;
     finished_ = true;
 
-    if (reason_ == FinishReason::kError) {
+    if (reason_ == FinishReason::kError || reason_ == FinishReason::kContextOverflow) {
         sink_.on_error(error_);
         return;
     }

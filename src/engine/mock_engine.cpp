@@ -18,6 +18,9 @@ EngineCaps MockModelEngine::caps() const {
         .n_batch   = config_.n_batch,
         .n_seq_max = config_.n_seq_max,
         .eos       = kEosToken,
+        // The mock imposes no real memory limit, so every sequence may use the whole
+        // context. Tests that need a constrained per-sequence budget set n_ctx directly.
+        .n_ctx_seq = config_.n_ctx,
     };
 }
 
@@ -54,9 +57,6 @@ std::vector<GenStep> MockModelEngine::decode(std::span<const BatchItem> batch) {
         if (config_.token_latency.count() > 0) {
             std::this_thread::sleep_for(config_.token_latency);
         }
-        if (!item.sample) {
-            continue;
-        }
 
         auto it = sequences_.find(item.seq);
         if (it == sequences_.end()) {
@@ -64,14 +64,22 @@ std::vector<GenStep> MockModelEngine::decode(std::span<const BatchItem> batch) {
         }
         SeqState& state = it->second;
 
-        // Echo mode: the first decode of a sequence is its prefill, so capture the
-        // prompt (minus the BOS token) as this sequence's response.
-        if (config_.echo_prompt && state.gen_index == 0 && state.echo.empty()) {
+        // Echo mode: accumulate the prompt (minus BOS) as this sequence's response.
+        //
+        // This runs for EVERY item, before the sampling check, because that is what a
+        // real engine does: all tokens in the batch are processed and populate the KV
+        // cache, and only the flagged ones produce logits. Capturing solely on sampling
+        // items would miss every intermediate chunk of a chunked prefill.
+        if (config_.echo_prompt && state.gen_index == 0) {
             for (const Token t : item.tokens) {
                 if (t != kBosToken) {
                     state.echo.push_back(t);
                 }
             }
+        }
+
+        if (!item.sample) {
+            continue;  // KV populated, but no token produced for this item
         }
         const std::vector<Token>& response = config_.echo_prompt ? state.echo : response_tokens_;
 

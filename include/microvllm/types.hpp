@@ -31,6 +31,9 @@ enum class FinishReason : std::uint8_t {
     kStopString, // matched one of the request's stop strings
     kCancelled,  // client disconnected or the server is draining
     kError,      // backend failure
+    // Prompt + max_tokens exceeds one sequence's context. A client error, not a server
+    // one: rejected at admission rather than failing mid-generation.
+    kContextOverflow,
 };
 
 const char* to_string(FinishReason) noexcept;

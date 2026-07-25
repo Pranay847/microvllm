@@ -118,6 +118,9 @@ EngineCaps LlamaModelEngine::caps() const {
         .n_batch   = llama_n_batch(impl_->context.get()),
         .n_seq_max = llama_n_seq_max(impl_->context.get()),
         .eos       = impl_->eos,
+        // Queried rather than derived: llama.h warns that the context's actual values
+        // may differ from what was requested.
+        .n_ctx_seq = llama_n_ctx_seq(impl_->context.get()),
     };
 }
 
