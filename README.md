@@ -5,11 +5,11 @@ serving engines fast under concurrent load — **continuous batching**, **reques
 and a **block-based KV-cache allocator with admission control** — around llama.cpp as the
 tensor backend.
 
-> **Status: Phase 3 complete.** A concurrent HTTP server serves a real model with **static
-> batching** — multiple sequences packed into one forward pass, measured at **2.06× the
-> single-sequence throughput** at batch size 16
-> ([benchmarks](docs/benchmarks.md#phase-3--throughput-vs-batch-size-static-batching)).
-> Continuous batching (Phase 4) and the paged KV-cache allocator (Phase 5) are next. See
+> **Status: Phase 4 complete.** A concurrent HTTP server serves a real model with
+> **continuous batching** — sequences are admitted and retired every step, with chunked
+> prefill and SSE streaming. Batching gives **2.06×** the single-sequence throughput, and
+> continuous scheduling cuts short-request p50 latency by **60%** under mixed-length load
+> ([benchmarks](docs/benchmarks.md)). The paged KV-cache allocator (Phase 5) is next. See
 > [docs/architecture.md](docs/architecture.md) for the design.
 
 ## What this is, and what it isn't
@@ -44,6 +44,26 @@ cmake --preset wsl-release
 cmake --build --preset wsl-release
 ctest --preset wsl-release
 ```
+
+Run the server and talk to it:
+
+```bash
+./build/src/microvllm --model models/qwen2.5-0.5b-instruct-q4_k_m.gguf --quiet
+```
+
+```bash
+curl -X POST localhost:8080/generate -d '{"prompt":"The capital of France is","max_tokens":16,"temperature":0}'
+```
+
+Stream tokens as they are generated:
+
+```bash
+curl -N -X POST localhost:8080/generate/stream -d '{"prompt":"Count to five:","max_tokens":32}'
+```
+
+Useful flags: `--batch-size` (sequences per forward pass), `--scheduler continuous|static`,
+`--prefill-chunk` (prompt tokens per sequence per step), `--ctx` (per-request context),
+`--queue` (depth before 503), `--mock-echo` (serve without a model, for load testing).
 
 ## Build presets
 

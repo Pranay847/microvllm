@@ -70,6 +70,24 @@ most load-bearing decision in the project:
 - **Scheduling cost is isolated.** Benchmarks against the mock engine measure the scheduler,
   not the model.
 
+## The per-sequence state machine
+
+`SequenceState` holds everything a single request needs to advance on its own: its prompt,
+its position, its stop strings, its token budget, its accounting. Both schedulers and the
+single-request generator drive the same object, so the stop and accounting rules are defined
+and tested exactly once rather than reimplemented per driver.
+
+Two details there matter more than they look:
+
+- **Positions are derived, not tracked.** The prompt occupies `[0, n_prompt)` and the k-th
+  generated token is fed back in at `n_prompt + k - 1`. Once sequences advance out of
+  lockstep, a mutable position counter is precisely where off-by-one bugs live; deriving it
+  makes that class of bug unrepresentable.
+- **Output is held back by `max_stop_len - 1` bytes.** A stop string can complete using bytes
+  already generated, so emitting eagerly would leak text that must be suppressed. The held-back
+  tail is flushed on a clean finish and discarded on a stop-string finish, which is what makes
+  the streamed deltas and the buffered result provably identical.
+
 ## Scheduling: static vs. continuous batching
 
 **Static batching** collects N requests, prefills them together, and decodes in lockstep until
@@ -88,10 +106,25 @@ Prefill (processing the prompt) is compute-bound and processes many tokens at on
 memory-bandwidth-bound and processes one token per sequence per step. A long prefill admitted
 whole will stall every decode in the batch — head-of-line blocking *inside* the batch.
 
-The scheduler therefore treats prefill as a budgeted resource: **chunked prefill** splits a long
-prompt across several steps so decodes keep progressing. This trades that request's
-time-to-first-token for everyone else's inter-token latency, which is a policy knob worth
-measuring rather than a setting worth guessing.
+The continuous scheduler therefore builds each step's batch in a deliberate order:
+
+1. **Decodes claim one token each, first.** Sequences already generating always make progress;
+   an arriving prompt can never stall them.
+2. **Prefills share whatever token budget remains**, capped at `prefill_chunk` per sequence, so
+   a 2000-token prompt is spread over many steps instead of monopolising one.
+
+That trades the arriving request's time-to-first-token for everyone else's inter-token latency
+— a policy knob worth measuring rather than a setting worth guessing, which is why it is a
+flag (`--prefill-chunk`) and not a constant.
+
+### Admission control on context length
+
+llama.cpp divides its KV pool across `n_seq_max`, so a request is bounded by `n_ctx_seq`, not
+`n_ctx` — raising the batch size silently shrinks every request's usable context. The scheduler
+checks `prompt + max_tokens` against `n_ctx_seq` when admitting and rejects an oversized request
+immediately with `kContextOverflow` (surfaced as HTTP 400), rather than admitting it and failing
+deep in the backend after the prefill compute has already been spent. This is the same class of
+decision Phase 5's block allocator generalises: knowing what will fit before starting work.
 
 ## KV-cache: the block allocator
 
