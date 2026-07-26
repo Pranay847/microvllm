@@ -11,6 +11,7 @@ add_library(microvllm_core STATIC
     core/generator.cpp
     core/sequence_state.cpp
     core/request_queue.cpp
+    core/block_allocator.cpp
     core/scheduler.cpp
     engine/mock_engine.cpp
 )

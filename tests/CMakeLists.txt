@@ -8,9 +8,11 @@ add_executable(microvllm_tests
     test_http_api.cpp
     test_request_queue.cpp
     test_sequence_state.cpp
+    test_block_allocator.cpp
     test_scheduler.cpp
     test_scheduler_serial.cpp
     test_scheduler_continuous.cpp
+    test_scheduler_kv.cpp
     test_streaming.cpp
     test_concurrency.cpp
 )

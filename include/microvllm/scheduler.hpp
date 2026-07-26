@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 
+#include "microvllm/block_allocator.hpp"
 #include "microvllm/model_engine.hpp"
 #include "microvllm/request_queue.hpp"
 
@@ -21,6 +22,13 @@ enum class BatchingMode {
 struct SchedulerConfig {
     std::size_t  max_batch_size = 8;
     BatchingMode mode           = BatchingMode::kContinuous;
+
+    // KV-cache budget, in blocks. 0 means "derive from the engine's context" -- the
+    // natural size, where the pool exactly covers what the backend can hold. Setting it
+    // lower deliberately constrains the cache so admission control, preemption, and
+    // eviction are observable on hardware whose cache cannot otherwise be exhausted.
+    std::uint32_t kv_blocks  = 0;
+    std::uint32_t block_size = 16;  // tokens per block, matching vLLM's default
 
     // Prompt tokens one sequence may submit per step. A long prompt admitted whole would
     // stall every decode sharing that step, so prefill is spread across steps instead.
@@ -62,6 +70,18 @@ public:
 
     [[nodiscard]] const SchedulerConfig& config() const { return config_; }
 
+    // Observable scheduling state, for /metrics and for tests asserting that admission
+    // control and preemption actually fired rather than merely not crashing.
+    struct Stats {
+        std::uint64_t admitted    = 0;
+        std::uint64_t completed   = 0;
+        std::uint64_t preemptions = 0;  // sequences evicted to free cache, then requeued
+        std::uint64_t deferred    = 0;  // admissions delayed because the pool was full
+        std::uint32_t kv_blocks_total = 0;
+        std::uint32_t kv_blocks_used  = 0;
+    };
+    [[nodiscard]] Stats stats() const;
+
 private:
     struct Job;  // one in-flight request: sink, sequence state, promise
 
@@ -73,6 +93,21 @@ private:
     void run_static();
     void run_continuous();
 
+    // Evict the most-recently-admitted sequence to free cache blocks, requeueing it for
+    // recompute. LIFO on purpose: the newest sequence has the least work invested, so
+    // throwing it away costs the least and older, closer-to-done requests keep their
+    // progress instead of being starved. Returns false if there is nothing to preempt.
+    // `except` is never evicted -- without it, making room for a starved sequence can
+    // evict that same sequence, which is readmitted, grows, and is evicted again.
+    [[nodiscard]] bool preempt_one(std::vector<std::unique_ptr<Job>>& active,
+                                   std::vector<SeqId>&               free_slots,
+                                   std::vector<Request>&             pending,
+                                   const Job*                        except = nullptr);
+
+    // Move a Job's request back out so it can be retried: promise, cancel flag, and sink
+    // travel with it, so a deferred or preempted client waits rather than seeing an error.
+    static Request reclaim(Job& job);
+
     // Block for one request, then sweep up whatever else is already waiting, without
     // waiting for the batch to fill: a lone request must never be delayed hoping for company.
     [[nodiscard]] std::vector<Request> next_batch();
@@ -80,9 +115,11 @@ private:
     // Finish a job, release its engine slot, and fulfill its promise.
     void retire(Job& job);
 
-    IModelEngine&   engine_;
-    RequestQueue&   queue_;
-    SchedulerConfig config_;
+    IModelEngine&                   engine_;
+    RequestQueue&                   queue_;
+    SchedulerConfig                 config_;
+    std::unique_ptr<BlockAllocator> blocks_;
+    Stats                           stats_{};
 };
 
 }  // namespace microvllm

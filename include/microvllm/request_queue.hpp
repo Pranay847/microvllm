@@ -35,6 +35,13 @@ public:
     // batch to fill -- so a lone request is never delayed hoping for company.
     [[nodiscard]] std::optional<Request> try_pop();
 
+    // Put a request at the HEAD of the queue. Used only for preemption: a sequence
+    // evicted to free cache has already waited once and partially run, so sending it to
+    // the back would risk starving it behind a stream of new arrivals. Ignores the
+    // capacity limit -- this request was already admitted, so refusing it here would
+    // mean dropping work the server had accepted.
+    [[nodiscard]] bool push_front(Request& req);
+
     // Stop accepting new requests and wake the consumer. Already-queued requests remain
     // poppable so the consumer can drain them; pop() returns nullopt once empty.
     void close();
