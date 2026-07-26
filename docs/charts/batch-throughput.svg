@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 380" width="720" height="380"
+     font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<style>
+  .t { fill: #c9d1d9; font-size: 15px; font-weight: 600; }
+  .s { fill: #8b949e; font-size: 11px; }
+  .a { fill: #c9d1d9; font-size: 11px; }
+  .v { fill: #c9d1d9; font-size: 11px; font-weight: 600; }
+</style>
+<text x="70" y="20" class="t">Throughput vs. batch size (static batching)</text>
+<text x="70" y="36" class="s">32 concurrent requests x 32 tokens, uniform length, 8 threads, median of 5 interleaved rounds. Bars show IQR.</text>
+
+<line x1="70" y1="324.0" x2="690" y2="324.0" stroke="#30363d" stroke-width="1"/>
+<text x="62" y="328.0" class="a" text-anchor="end">0</text>
+<line x1="70" y1="268.4" x2="690" y2="268.4" stroke="#30363d" stroke-width="1"/>
+<text x="62" y="272.4" class="a" text-anchor="end">16</text>
+<line x1="70" y1="212.8" x2="690" y2="212.8" stroke="#30363d" stroke-width="1"/>
+<text x="62" y="216.8" class="a" text-anchor="end">32</text>
+<line x1="70" y1="157.2" x2="690" y2="157.2" stroke="#30363d" stroke-width="1"/>
+<text x="62" y="161.2" class="a" text-anchor="end">48</text>
+<line x1="70" y1="101.6" x2="690" y2="101.6" stroke="#30363d" stroke-width="1"/>
+<text x="62" y="105.6" class="a" text-anchor="end">64</text>
+<line x1="70" y1="46.0" x2="690" y2="46.0" stroke="#30363d" stroke-width="1"/>
+<text x="62" y="50.0" class="a" text-anchor="end">80</text>
+<text x="16" y="185" class="a" transform="rotate(-90 16 185)" text-anchor="middle">output tokens/sec</text>
+<rect x="101.0" y="201.1" width="62.0" height="122.9" fill="#58a6ff" opacity="0.85" rx="2"/>
+<line x1="132.0" y1="189.8" x2="132.0" y2="210.4" stroke="#c9d1d9" stroke-width="1.5" opacity="0.7"/>
+<text x="132.0" y="193.1" class="v" text-anchor="middle">35.4</text>
+<text x="132.0" y="342" class="a" text-anchor="middle">1</text>
+<rect x="225.0" y="132.0" width="62.0" height="192.0" fill="#58a6ff" opacity="0.85" rx="2"/>
+<line x1="256.0" y1="122.8" x2="256.0" y2="176.7" stroke="#c9d1d9" stroke-width="1.5" opacity="0.7"/>
+<text x="256.0" y="124.0" class="v" text-anchor="middle">55.2</text>
+<text x="256.0" y="342" class="a" text-anchor="middle">4</text>
+<rect x="349.0" y="103.0" width="62.0" height="221.0" fill="#58a6ff" opacity="0.85" rx="2"/>
+<line x1="380.0" y1="100.7" x2="380.0" y2="106.7" stroke="#c9d1d9" stroke-width="1.5" opacity="0.7"/>
+<text x="380.0" y="95.0" class="v" text-anchor="middle">63.6</text>
+<text x="380.0" y="342" class="a" text-anchor="middle">8</text>
+<rect x="473.0" y="70.9" width="62.0" height="253.1" fill="#3fb950" opacity="0.85" rx="2"/>
+<line x1="504.0" y1="70.0" x2="504.0" y2="73.6" stroke="#c9d1d9" stroke-width="1.5" opacity="0.7"/>
+<text x="504.0" y="62.9" class="v" text-anchor="middle">72.8</text>
+<text x="504.0" y="342" class="a" text-anchor="middle">16</text>
+<rect x="597.0" y="126.4" width="62.0" height="197.6" fill="#58a6ff" opacity="0.85" rx="2"/>
+<line x1="628.0" y1="111.2" x2="628.0" y2="127.3" stroke="#c9d1d9" stroke-width="1.5" opacity="0.7"/>
+<text x="628.0" y="118.4" class="v" text-anchor="middle">56.9</text>
+<text x="628.0" y="342" class="a" text-anchor="middle">32</text>
+<text x="380" y="360" class="a" text-anchor="middle">batch size</text>
+<text x="690" y="360" class="s" text-anchor="end">peak 2.06x at 16, then KV pressure regresses it</text>
+</svg>

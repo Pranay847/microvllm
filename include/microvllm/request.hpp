@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 
+#include "microvllm/timing.hpp"
 #include "microvllm/token_sink.hpp"
 #include "microvllm/types.hpp"
 
@@ -13,10 +14,11 @@ namespace microvllm {
 // The outcome of one generation, delivered from the engine thread back to the HTTP
 // thread that submitted the request.
 struct GenResult {
-    std::string  text;
-    FinishReason reason = FinishReason::kError;
-    Usage        usage;
-    std::string  error;  // populated only when reason == kError
+    std::string   text;
+    FinishReason  reason = FinishReason::kError;
+    Usage         usage;
+    std::string   error;  // populated only when reason == kError
+    RequestTiming timing{};
 };
 
 // A unit of work handed from an HTTP thread to the engine thread through RequestQueue.
@@ -35,6 +37,10 @@ struct Request {
     // The streaming endpoint supplies a StreamingSink so the HTTP thread can write SSE
     // events while generation is still running.
     std::shared_ptr<ITokenSink> sink;
+
+    // Stamped on the HTTP thread before queueing; the scheduler fills in the rest. The
+    // queue's mutex provides the happens-before edge for the handoff.
+    RequestTiming timing{};
 
     Request() = default;
     Request(Request&&) noexcept            = default;

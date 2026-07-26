@@ -17,6 +17,7 @@ struct ServerConfig {
     std::uint32_t kv_blocks      = 0;    // 0 = derive from the engine's context
     std::uint32_t block_size     = 16;   // tokens per KV block
     bool          prefix_caching = true;
+    bool          log_requests   = false;  // one structured JSON line per completed request
 };
 
 // Serve POST /generate and GET /health against `engine`, blocking until the process

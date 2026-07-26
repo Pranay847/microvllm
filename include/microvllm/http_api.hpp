@@ -3,6 +3,7 @@
 #include <string>
 #include <string_view>
 
+#include "microvllm/request.hpp"
 #include "microvllm/types.hpp"
 
 // The request/response contract for POST /generate, as pure string<->value functions.
@@ -29,6 +30,13 @@ std::string make_generate_response(std::string_view text, FinishReason reason, c
 
 // Serialize an error into a JSON body: {"error": message}.
 std::string make_error_response(std::string_view message);
+
+// One structured log line for a completed request: a single JSON object.
+//
+// JSON rather than prose so it can be piped straight into a log aggregator, and per
+// request rather than aggregated so the tail is visible -- an average latency hides
+// exactly the requests worth investigating. The token counts double as usage metering.
+std::string make_request_log(RequestId id, const GenResult& result);
 
 // One incremental chunk of a streamed response: {"text": delta}.
 std::string make_stream_delta(std::string_view delta);

@@ -94,6 +94,50 @@ bool serve(IModelEngine& engine, const ServerConfig& config) {
         counter("prefix_tokens_saved_total", "Prompt tokens not prefilled thanks to sharing.",
                 s.prefix_tokens_saved);
 
+        counter("prompt_tokens_total", "Input tokens served.", s.prompt_tokens);
+        counter("completion_tokens_total", "Output tokens generated.", s.completion_tokens);
+
+        // Prometheus histograms are cumulative: each bucket counts observations <= its
+        // bound, which is what lets a scraper interpolate percentiles.
+        const auto histogram = [&out](const char* name, const char* help,
+                                      const LatencyHistogram& h) {
+            out += "# HELP microvllm_";
+            out += name;
+            out += ' ';
+            out += help;
+            out += "\n# TYPE microvllm_";
+            out += name;
+            out += " histogram\n";
+            std::uint64_t cumulative = 0;
+            for (std::size_t i = 0; i < LatencyHistogram::kBounds.size(); ++i) {
+                cumulative += h.bucket(i);
+                out += "microvllm_";
+                out += name;
+                out += "_bucket{le=\"";
+                out += std::to_string(LatencyHistogram::kBounds[i] / 1000.0);
+                out += "\"} ";
+                out += std::to_string(cumulative);
+                out += '\n';
+            }
+            out += "microvllm_";
+            out += name;
+            out += "_bucket{le=\"+Inf\"} ";
+            out += std::to_string(h.count());
+            out += "\nmicrovllm_";
+            out += name;
+            out += "_sum ";
+            out += std::to_string(h.sum_seconds());
+            out += "\nmicrovllm_";
+            out += name;
+            out += "_count ";
+            out += std::to_string(h.count());
+            out += '\n';
+        };
+        histogram("ttft_seconds", "Time from admission to first token.",
+                  scheduler.ttft_histogram());
+        histogram("request_duration_seconds", "End-to-end request latency including queueing.",
+                  scheduler.e2e_histogram());
+
         gauge("queue_depth", "Requests waiting to be admitted.", queue.size());
         gauge("kv_blocks_total", "KV-cache blocks in the pool.", s.kv_blocks_total);
         gauge("kv_blocks_used", "KV-cache blocks currently allocated.", s.kv_blocks_used);
@@ -121,11 +165,13 @@ bool serve(IModelEngine& engine, const ServerConfig& config) {
         // IModelEngine is single-threaded by contract.
 
         // Keep a copy of the cancel flag and the future: `r` is moved into the queue.
-        auto    cancel = std::make_shared<std::atomic<bool>>(false);
-        Request r;
-        r.id     = next_id.fetch_add(1, std::memory_order_relaxed);
+        auto      cancel = std::make_shared<std::atomic<bool>>(false);
+        const auto r_id  = next_id.fetch_add(1, std::memory_order_relaxed);
+        Request   r;
+        r.id     = r_id;
         r.spec   = std::move(spec);
         r.cancel = cancel;
+        r.timing.enqueued = Clock::now();
         std::future<GenResult> fut = r.result.get_future();
 
         if (!queue.try_push(r)) {
@@ -143,6 +189,19 @@ bool serve(IModelEngine& engine, const ServerConfig& config) {
         }
 
         const GenResult result = fut.get();
+        if (config.log_requests) {
+            // One line per request: cheap enough to leave on, and the token counts double
+            // as usage metering.
+            //
+            // Flushed explicitly. stdout is block-buffered when it is not a terminal --
+            // which is precisely how a server runs in production, redirected to a file or
+            // a log collector -- so without this the lines sit in the buffer and are lost
+            // entirely if the process is killed.
+            std::string line = make_request_log(r_id, result);
+            line += "\n";
+            std::fputs(line.c_str(), stdout);
+            std::fflush(stdout);
+        }
         if (result.reason == FinishReason::kContextOverflow) {
             res.status = 400;  // the client asked for more than the context can hold
             res.set_content(make_error_response(result.error), kJson);
@@ -178,6 +237,7 @@ bool serve(IModelEngine& engine, const ServerConfig& config) {
         r.id     = next_id.fetch_add(1, std::memory_order_relaxed);
         r.spec   = std::move(spec);
         r.cancel = cancel;
+        r.timing.enqueued = Clock::now();
         r.sink   = sink;
         std::future<GenResult> fut = r.result.get_future();
 

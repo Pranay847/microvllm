@@ -2,6 +2,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
+
 namespace microvllm {
 
 using nlohmann::json;
@@ -93,6 +95,28 @@ std::string make_generate_response(std::string_view text, FinishReason reason, c
 
 std::string make_error_response(std::string_view message) {
     const json j = {{"error", message}};
+    return j.dump();
+}
+
+std::string make_request_log(RequestId id, const GenResult& result) {
+    // Rounded to 0.01 ms: sub-microsecond precision is noise on a request that takes
+    // milliseconds, and full float precision makes the lines hard to scan.
+    const auto round2 = [](double v) { return std::round(v * 100.0) / 100.0; };
+    const auto& t     = result.timing;
+
+    const json j = {
+        {"event", "request_complete"},
+        {"request_id", id},
+        {"finish_reason", to_string(result.reason)},
+        {"prompt_tokens", result.usage.prompt_tokens},
+        {"completion_tokens", result.usage.completion_tokens},
+        {"cached_prompt_tokens", result.usage.cached_prompt_tokens},
+        {"queue_wait_ms", round2(t.queue_wait_ms())},
+        {"ttft_ms", round2(t.ttft_ms())},
+        {"tpot_ms", round2(t.tpot_ms(result.usage.completion_tokens))},
+        {"total_ms", round2(t.total_ms())},
+        {"output_tokens_per_sec", round2(t.output_tokens_per_sec(result.usage.completion_tokens))},
+    };
     return j.dump();
 }
 
