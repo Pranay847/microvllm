@@ -34,6 +34,7 @@ struct Args {
     std::uint32_t kv_blocks    = 0;
     std::uint32_t block_size   = 16;
     bool          no_prefix_cache = false;
+    bool          log_requests    = false;
     microvllm::BatchingMode mode = microvllm::BatchingMode::kContinuous;
 };
 
@@ -123,6 +124,8 @@ Args parse_args(int argc, char** argv) {
                 static_cast<std::uint32_t>(std::atoi(need_value(argc, argv, i, argv[0])));
         } else if (std::strcmp(arg, "--no-prefix-cache") == 0) {
             a.no_prefix_cache = true;
+        } else if (std::strcmp(arg, "--log-requests") == 0) {
+            a.log_requests = true;
         } else if (std::strcmp(arg, "--quiet") == 0) {
             a.quiet = true;
         } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
@@ -151,7 +154,8 @@ int main(int argc, char** argv) {
                                              .prefill_chunk   = args.prefill_chunk,
                                              .kv_blocks       = args.kv_blocks,
                                              .block_size      = args.block_size,
-                                             .prefix_caching  = !args.no_prefix_cache};
+                                             .prefix_caching  = !args.no_prefix_cache,
+                                             .log_requests    = args.log_requests};
 
     if (args.has_mock) {
         std::printf("microvllm %s (mock engine%s)\n", microvllm::kVersion,

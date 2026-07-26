@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "microvllm/block_allocator.hpp"
+#include "microvllm/latency_histogram.hpp"
 #include "microvllm/model_engine.hpp"
 #include "microvllm/request_queue.hpp"
 
@@ -89,18 +90,27 @@ public:
         std::uint64_t deferred    = 0;  // admissions delayed because the pool was full
         std::uint64_t prefix_hits = 0;  // requests that inherited a cached prompt prefix
         std::uint64_t prefix_tokens_saved = 0;  // prompt tokens not prefilled thanks to hits
+        std::uint64_t prompt_tokens     = 0;    // billable input tokens served
+        std::uint64_t completion_tokens = 0;    // billable output tokens served
         std::uint32_t kv_blocks_total = 0;
         std::uint32_t kv_blocks_used  = 0;
     };
     [[nodiscard]] Stats stats() const;
+
+    // Latency distributions, for /metrics percentile queries. Safe to read from any
+    // thread; the scheduler thread observes into them as requests complete.
+    [[nodiscard]] const LatencyHistogram& ttft_histogram() const { return ttft_hist_; }
+    [[nodiscard]] const LatencyHistogram& e2e_histogram() const { return e2e_hist_; }
 
 private:
     struct Job;  // one in-flight request: sink, sequence state, promise
 
     // Build a Job and register its sequence with the engine.
     static std::unique_ptr<Job> make_job(IModelEngine& engine, Request req, SeqId seq);
-    // Fulfill a job's promise from its sink.
-    static void deliver(Job& job);
+    // Fulfill a job's promise and record its timing. Non-static because this is the one
+    // point every request passes through on completion, which makes it the right place to
+    // observe latency and token counts exactly once.
+    void deliver(Job& job);
 
     void run_static();
     void run_continuous();
@@ -141,10 +151,14 @@ private:
         std::atomic<std::uint64_t> deferred{0};
         std::atomic<std::uint64_t> prefix_hits{0};
         std::atomic<std::uint64_t> prefix_tokens_saved{0};
+        std::atomic<std::uint64_t> prompt_tokens{0};
+        std::atomic<std::uint64_t> completion_tokens{0};
         std::atomic<std::uint32_t> kv_blocks_total{0};
         std::atomic<std::uint32_t> kv_blocks_used{0};
     };
-    AtomicStats stats_;
+    AtomicStats      stats_;
+    LatencyHistogram ttft_hist_;
+    LatencyHistogram e2e_hist_;
 };
 
 }  // namespace microvllm

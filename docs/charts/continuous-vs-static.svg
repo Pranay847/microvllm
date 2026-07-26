@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 380" width="720" height="380"
+     font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<style>
+  .t { fill: #c9d1d9; font-size: 15px; font-weight: 600; }
+  .s { fill: #8b949e; font-size: 11px; }
+  .a { fill: #c9d1d9; font-size: 11px; }
+  .v { fill: #c9d1d9; font-size: 11px; font-weight: 600; }
+</style>
+<text x="70" y="20" class="t">Continuous vs. static batching under mixed-length load</text>
+<text x="70" y="36" class="s">80% short (16-32 tok), 20% long (256-512 tok). Lower is better. Median of 3 interleaved rounds.</text>
+
+<line x1="70" y1="324.0" x2="690" y2="324.0" stroke="#30363d" stroke-width="1"/>
+<text x="62" y="328.0" class="a" text-anchor="end">0</text>
+<line x1="70" y1="268.4" x2="690" y2="268.4" stroke="#30363d" stroke-width="1"/>
+<text x="62" y="272.4" class="a" text-anchor="end">10</text>
+<line x1="70" y1="212.8" x2="690" y2="212.8" stroke="#30363d" stroke-width="1"/>
+<text x="62" y="216.8" class="a" text-anchor="end">20</text>
+<line x1="70" y1="157.2" x2="690" y2="157.2" stroke="#30363d" stroke-width="1"/>
+<text x="62" y="161.2" class="a" text-anchor="end">30</text>
+<line x1="70" y1="101.6" x2="690" y2="101.6" stroke="#30363d" stroke-width="1"/>
+<text x="62" y="105.6" class="a" text-anchor="end">40</text>
+<line x1="70" y1="46.0" x2="690" y2="46.0" stroke="#30363d" stroke-width="1"/>
+<text x="62" y="50.0" class="a" text-anchor="end">50</text>
+<text x="16" y="185" class="a" transform="rotate(-90 16 185)" text-anchor="middle">latency (seconds)</text>
+<rect x="500" y="14" width="10" height="10" fill="#f0883e" rx="2"/><text x="515" y="23" class="a">static</text><rect x="572" y="14" width="10" height="10" fill="#58a6ff" rx="2"/><text x="587" y="23" class="a">continuous</text>
+<rect x="101.0" y="204.8" width="43.5" height="119.2" fill="#f0883e" opacity="0.85" rx="2"/>
+<text x="122.8" y="198.8" class="v" text-anchor="middle">21.4</text>
+<rect x="147.5" y="276.7" width="43.5" height="47.3" fill="#58a6ff" opacity="0.85" rx="2"/>
+<text x="169.2" y="270.7" class="v" text-anchor="middle">8.5</text>
+<text x="147.5" y="342" class="a" text-anchor="middle">short p50</text>
+<rect x="256.0" y="152.2" width="43.5" height="171.8" fill="#f0883e" opacity="0.85" rx="2"/>
+<text x="277.8" y="146.2" class="v" text-anchor="middle">30.9</text>
+<rect x="302.5" y="250.4" width="43.5" height="73.6" fill="#58a6ff" opacity="0.85" rx="2"/>
+<text x="324.2" y="244.4" class="v" text-anchor="middle">13.2</text>
+<text x="302.5" y="342" class="a" text-anchor="middle">short p95</text>
+<rect x="411.0" y="152.2" width="43.5" height="171.8" fill="#f0883e" opacity="0.85" rx="2"/>
+<text x="432.8" y="146.2" class="v" text-anchor="middle">30.9</text>
+<rect x="457.5" y="232.8" width="43.5" height="91.2" fill="#58a6ff" opacity="0.85" rx="2"/>
+<text x="479.2" y="226.8" class="v" text-anchor="middle">16.4</text>
+<text x="457.5" y="342" class="a" text-anchor="middle">short p99</text>
+<rect x="566.0" y="204.8" width="43.5" height="119.2" fill="#f0883e" opacity="0.85" rx="2"/>
+<text x="587.8" y="198.8" class="v" text-anchor="middle">21.4</text>
+<rect x="612.5" y="62.0" width="43.5" height="262.0" fill="#58a6ff" opacity="0.85" rx="2"/>
+<text x="634.2" y="56.0" class="v" text-anchor="middle">47.1</text>
+<text x="612.5" y="342" class="a" text-anchor="middle">long p50</text>
+<text x="70" y="360" class="s">Short requests 2.5x faster; long requests pay for it. Fairness, not throughput.</text>
+</svg>

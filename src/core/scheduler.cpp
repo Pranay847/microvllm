@@ -35,6 +35,21 @@ void Scheduler::deliver(Job& job) {
         result.reason == FinishReason::kContextOverflow) {
         result.error = job.state->error();
     }
+    result.timing = job.request.timing;
+    if (!result.timing.finished) {
+        result.timing.finished = Clock::now();
+    }
+
+    // Record once, here, so every completion path -- normal, cancelled, preempted-then-
+    // finished, failed -- is counted exactly once and none can be forgotten.
+    stats_.prompt_tokens.fetch_add(result.usage.prompt_tokens, std::memory_order_relaxed);
+    stats_.completion_tokens.fetch_add(result.usage.completion_tokens,
+                                       std::memory_order_relaxed);
+    if (result.timing.first_token) {
+        ttft_hist_.observe(result.timing.ttft_ms());
+    }
+    e2e_hist_.observe(result.timing.total_ms());
+
     job.request.result.set_value(std::move(result));
 }
 
@@ -149,6 +164,8 @@ Scheduler::Stats Scheduler::stats() const {
     s.deferred            = stats_.deferred.load(std::memory_order_relaxed);
     s.prefix_hits         = stats_.prefix_hits.load(std::memory_order_relaxed);
     s.prefix_tokens_saved = stats_.prefix_tokens_saved.load(std::memory_order_relaxed);
+    s.prompt_tokens       = stats_.prompt_tokens.load(std::memory_order_relaxed);
+    s.completion_tokens   = stats_.completion_tokens.load(std::memory_order_relaxed);
     s.kv_blocks_total     = stats_.kv_blocks_total.load(std::memory_order_relaxed);
     s.kv_blocks_used      = stats_.kv_blocks_used.load(std::memory_order_relaxed);
     return s;
@@ -178,6 +195,12 @@ Request Scheduler::reclaim(Job& job) {
     out.cancel = std::move(job.request.cancel);
     out.sink   = std::move(job.request.sink);
     out.result = std::move(job.request.result);
+    // Keep the original enqueue stamp: from the client's perspective the wait began when
+    // they sent the request, not when it was re-admitted. The per-attempt stamps are
+    // cleared, since a preempted request is recomputed from scratch.
+    out.timing          = job.request.timing;
+    out.timing.admitted = std::nullopt;
+    out.timing.first_token = std::nullopt;
     return out;
 }
 
@@ -325,6 +348,7 @@ void Scheduler::run_continuous() {
 
             pending.erase(pending.begin());
             free_slots.pop_back();
+            job->request.timing.admitted = Clock::now();
             stats_.admitted.fetch_add(1, std::memory_order_relaxed);
             active.push_back(std::move(job));
         }
@@ -383,6 +407,11 @@ void Scheduler::run_continuous() {
                 // --- 4. accept ------------------------------------------------------
                 for (std::size_t k = 0; k < sampling.size(); ++k) {
                     Job& job = *sampling[k];
+                    // Stamped before accept() so it marks when the engine produced the
+                    // token, not when the stop rules finished considering it.
+                    if (!job.request.timing.first_token) {
+                        job.request.timing.first_token = Clock::now();
+                    }
                     if (!job.state->accept(engine_, steps.at(k))) {
                         job.state->finish();
                         continue;
@@ -512,6 +541,7 @@ void Scheduler::run_batch(std::vector<Request> batch) {
             job->state->fail("KV cache exhausted: not enough blocks for this batch",
                              FinishReason::kContextOverflow);
         } else {
+            job->request.timing.admitted = Clock::now();
             stats_.admitted.fetch_add(1, std::memory_order_relaxed);
         }
         jobs.push_back(std::move(job));
@@ -554,6 +584,9 @@ void Scheduler::run_batch(std::vector<Request> batch) {
             const std::vector<GenStep> steps = engine_.decode(items);
             for (std::size_t k = 0; k < submitted.size(); ++k) {
                 Job& j = *submitted[k];
+                if (!j.request.timing.first_token) {
+                    j.request.timing.first_token = Clock::now();
+                }
                 if (!j.state->accept(engine_, steps.at(k))) {
                     j.state->finish();
                     engine_.release_sequence(j.state->seq());
@@ -582,6 +615,9 @@ void Scheduler::run_batch(std::vector<Request> batch) {
             const std::vector<GenStep> steps = engine_.decode(items);
             for (std::size_t k = 0; k < active.size(); ++k) {
                 Job& j = *active[k];
+                if (!j.request.timing.first_token) {
+                    j.request.timing.first_token = Clock::now();
+                }
                 if (!j.state->accept(engine_, steps.at(k))) {
                     j.state->finish();
                     engine_.release_sequence(j.state->seq());

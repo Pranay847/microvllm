@@ -3,6 +3,7 @@
 # means a ThreadSanitizer report can only be about first-party code.
 add_executable(microvllm_tests
     test_types.cpp
+    test_timing.cpp
     test_mock_engine.cpp
     test_generator.cpp
     test_http_api.cpp
