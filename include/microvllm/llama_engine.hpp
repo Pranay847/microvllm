@@ -60,6 +60,7 @@ public:
     void begin_sequence(SeqId seq, const SamplingParams& params) override;
     [[nodiscard]] std::vector<GenStep> decode(std::span<const BatchItem> batch) override;
     void release_sequence(SeqId seq) override;
+    void copy_sequence(SeqId src, SeqId dst, Pos n_tokens) override;
 
 private:
     struct Impl;

@@ -9,6 +9,7 @@ add_executable(microvllm_tests
     test_request_queue.cpp
     test_sequence_state.cpp
     test_block_allocator.cpp
+    test_prefix_cache.cpp
     test_scheduler.cpp
     test_scheduler_serial.cpp
     test_scheduler_continuous.cpp

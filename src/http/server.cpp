@@ -35,6 +35,9 @@ bool serve(IModelEngine& engine, const ServerConfig& config) {
     Scheduler    scheduler(engine, queue,
                            SchedulerConfig{.max_batch_size = config.max_batch_size,
                                            .mode           = config.mode,
+                                           .kv_blocks      = config.kv_blocks,
+                                           .block_size     = config.block_size,
+                                           .prefix_caching = config.prefix_caching,
                                            .prefill_chunk  = config.prefill_chunk});
     std::thread  worker_thread([&] { scheduler.run(); });
 
@@ -44,6 +47,63 @@ bool serve(IModelEngine& engine, const ServerConfig& config) {
 
     server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(R"({"status":"ok"})", kJson);
+    });
+
+    // Prometheus text format. Served from an HTTP thread while the scheduler thread is
+    // running, so everything here comes from atomic snapshots -- Scheduler::stats() and
+    // RequestQueue's own locking -- never from reaching into scheduler internals.
+    server.Get("/metrics", [&](const httplib::Request&, httplib::Response& res) {
+        const Scheduler::Stats s = scheduler.stats();
+        std::string            out;
+
+        const auto counter = [&out](const char* name, const char* help, auto value) {
+            out += "# HELP microvllm_";
+            out += name;
+            out += ' ';
+            out += help;
+            out += "\n# TYPE microvllm_";
+            out += name;
+            out += " counter\nmicrovllm_";
+            out += name;
+            out += ' ';
+            out += std::to_string(value);
+            out += '\n';
+        };
+        const auto gauge = [&out](const char* name, const char* help, auto value) {
+            out += "# HELP microvllm_";
+            out += name;
+            out += ' ';
+            out += help;
+            out += "\n# TYPE microvllm_";
+            out += name;
+            out += " gauge\nmicrovllm_";
+            out += name;
+            out += ' ';
+            out += std::to_string(value);
+            out += '\n';
+        };
+
+        counter("requests_admitted_total", "Sequences admitted to the batch.", s.admitted);
+        counter("requests_completed_total", "Sequences run to completion.", s.completed);
+        counter("preemptions_total", "Sequences evicted to free KV cache and requeued.",
+                s.preemptions);
+        counter("admissions_deferred_total", "Admissions delayed because the KV pool was full.",
+                s.deferred);
+        counter("prefix_cache_hits_total", "Requests that inherited a cached prompt prefix.",
+                s.prefix_hits);
+        counter("prefix_tokens_saved_total", "Prompt tokens not prefilled thanks to sharing.",
+                s.prefix_tokens_saved);
+
+        gauge("queue_depth", "Requests waiting to be admitted.", queue.size());
+        gauge("kv_blocks_total", "KV-cache blocks in the pool.", s.kv_blocks_total);
+        gauge("kv_blocks_used", "KV-cache blocks currently allocated.", s.kv_blocks_used);
+        gauge("kv_utilization",
+              "Fraction of the KV pool in use.",
+              s.kv_blocks_total == 0
+                  ? 0.0
+                  : static_cast<double>(s.kv_blocks_used) / s.kv_blocks_total);
+
+        res.set_content(out, "text/plain; version=0.0.4");
     });
 
     server.Post("/generate", [&](const httplib::Request& req, httplib::Response& res) {

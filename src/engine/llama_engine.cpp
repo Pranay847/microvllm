@@ -235,4 +235,13 @@ void LlamaModelEngine::release_sequence(SeqId seq) {
     llama_memory_seq_rm(impl_->memory, seq, -1, -1);  // drop the whole sequence's KV cache
 }
 
+void LlamaModelEngine::copy_sequence(SeqId src, SeqId dst, Pos n_tokens) {
+    if (n_tokens <= 0 || src == dst) {
+        return;
+    }
+    // Positions [0, n_tokens) only: the shared prefix. The destination prefills just its
+    // divergent suffix from n_tokens onward.
+    llama_memory_seq_cp(impl_->memory, src, dst, 0, n_tokens);
+}
+
 }  // namespace microvllm

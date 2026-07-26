@@ -95,7 +95,7 @@ Scheduler::Scheduler(IModelEngine& engine, RequestQueue& queue, SchedulerConfig 
     config_.block_size = block_size;
     config_.kv_blocks  = pool;
     blocks_            = std::make_unique<BlockAllocator>(pool, block_size);
-    stats_.kv_blocks_total = pool;
+    stats_.kv_blocks_total.store(pool, std::memory_order_relaxed);
 
     if (config_.max_batch_size == 0) {
         config_.max_batch_size = 1;
@@ -142,21 +142,29 @@ void Scheduler::run_static() {
 }
 
 Scheduler::Stats Scheduler::stats() const {
-    Stats s = stats_;
-    if (blocks_) {
-        s.kv_blocks_total = blocks_->total_blocks();
-        s.kv_blocks_used  = blocks_->used_blocks();
-    }
+    Stats s;
+    s.admitted            = stats_.admitted.load(std::memory_order_relaxed);
+    s.completed           = stats_.completed.load(std::memory_order_relaxed);
+    s.preemptions         = stats_.preemptions.load(std::memory_order_relaxed);
+    s.deferred            = stats_.deferred.load(std::memory_order_relaxed);
+    s.prefix_hits         = stats_.prefix_hits.load(std::memory_order_relaxed);
+    s.prefix_tokens_saved = stats_.prefix_tokens_saved.load(std::memory_order_relaxed);
+    s.kv_blocks_total     = stats_.kv_blocks_total.load(std::memory_order_relaxed);
+    s.kv_blocks_used      = stats_.kv_blocks_used.load(std::memory_order_relaxed);
     return s;
 }
 
 void Scheduler::retire(Job& job) {
     job.state->finish();  // idempotent
+    // A cache entry names a live sequence whose KV is about to stop existing, so it must
+    // go before the sequence does -- otherwise a later hit would copy from a slot that has
+    // been recycled by an unrelated request.
+    prefix_cache_.evict_sequence(job.state->seq());
     if (job.blocks) {
         job.blocks->release();  // return this sequence's cache to the pool
     }
     engine_.release_sequence(job.state->seq());
-    ++stats_.completed;
+    stats_.completed.fetch_add(1, std::memory_order_relaxed);
     deliver(job);
 }
 
@@ -196,13 +204,14 @@ bool Scheduler::preempt_one(std::vector<std::unique_ptr<Job>>& active,
         // scratch on readmission, which is vLLM's recompute preemption.
         Request requeued = reclaim(job);
 
+        prefix_cache_.evict_sequence(job.state->seq());  // its KV is about to disappear
         job.blocks->release();
         engine_.release_sequence(job.state->seq());
         free_slots.push_back(job.state->seq());
 
         active.erase(std::next(it).base());
         pending.insert(pending.begin(), std::move(requeued));
-        ++stats_.preemptions;
+        stats_.preemptions.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     return false;
@@ -293,13 +302,30 @@ void Scheduler::run_continuous() {
                 // Put it back untouched and let running sequences drain first.
                 engine_.release_sequence(slot);
                 pending.front() = reclaim(*job);
-                ++stats_.deferred;
+                stats_.deferred.fetch_add(1, std::memory_order_relaxed);
                 break;
+            }
+
+            // Prefix sharing: if another live sequence already holds the KV for a leading
+            // run of this prompt, inherit it rather than prefilling it again. The copy is
+            // mirrored into the backend (llama_memory_seq_cp), so the saving is real work
+            // avoided -- not just refcount bookkeeping.
+            if (config_.prefix_caching && !job->state->finished()) {
+                const auto hit = prefix_cache_.find_longest(job->state->prompt(),
+                                                            blocks_->block_size());
+                if (hit && hit->seq != job->state->seq()) {
+                    engine_.copy_sequence(hit->seq, job->state->seq(),
+                                          static_cast<Pos>(hit->n_tokens));
+                    job->blocks->adopt_shared_prefix(hit->blocks, hit->n_tokens);
+                    job->state->adopt_cached_prefix(hit->n_tokens);
+                    stats_.prefix_hits.fetch_add(1, std::memory_order_relaxed);
+                    stats_.prefix_tokens_saved.fetch_add(hit->n_tokens, std::memory_order_relaxed);
+                }
             }
 
             pending.erase(pending.begin());
             free_slots.pop_back();
-            ++stats_.admitted;
+            stats_.admitted.fetch_add(1, std::memory_order_relaxed);
             active.push_back(std::move(job));
         }
         if (active.empty()) {
@@ -367,6 +393,27 @@ void Scheduler::run_continuous() {
                                                  job.state->usage().completion_tokens;
                     if (!job.blocks->ensure_capacity(needed)) {
                         grew_short.push_back(&job);
+                        continue;
+                    }
+
+                    // Publish this sequence's prompt prefix once prefill is done, so
+                    // later requests sharing it can inherit the KV instead of recomputing
+                    // it. Only whole blocks are offered -- the last, partially-filled
+                    // block is still being written and cannot be shared.
+                    if (config_.prefix_caching && !job.state->prefilling()) {
+                        const auto prompt   = job.state->prompt();
+                        const auto bs       = blocks_->block_size();
+                        const auto n_blocks = static_cast<std::uint32_t>(prompt.size() / bs);
+                        if (n_blocks > 0 && job.blocks->n_blocks() >= n_blocks) {
+                            const std::uint32_t n_tokens = n_blocks * bs;
+                            PrefixCache::Entry  entry;
+                            entry.seq      = job.state->seq();
+                            entry.n_tokens = n_tokens;
+                            entry.blocks.assign(job.blocks->blocks().begin(),
+                                                job.blocks->blocks().begin() + n_blocks);
+                            prefix_cache_.insert(PrefixCache::hash_prefix(prompt, n_tokens),
+                                                 std::move(entry));
+                        }
                     }
                 }
             }
@@ -438,6 +485,10 @@ void Scheduler::run_continuous() {
                 ++it;
             }
         }
+
+        // Publish pool utilization from this thread. BlockAllocator is not thread-safe, so
+        // /metrics must read a snapshot rather than reach into the allocator itself.
+        stats_.kv_blocks_used.store(blocks_->used_blocks(), std::memory_order_relaxed);
     }
 }
 
@@ -461,7 +512,7 @@ void Scheduler::run_batch(std::vector<Request> batch) {
             job->state->fail("KV cache exhausted: not enough blocks for this batch",
                              FinishReason::kContextOverflow);
         } else {
-            ++stats_.admitted;
+            stats_.admitted.fetch_add(1, std::memory_order_relaxed);
         }
         jobs.push_back(std::move(job));
     }
@@ -556,9 +607,10 @@ void Scheduler::run_batch(std::vector<Request> batch) {
         if (j.blocks) {
             j.blocks->release();  // return this batch's cache before the next one forms
         }
-        ++stats_.completed;
+        stats_.completed.fetch_add(1, std::memory_order_relaxed);
         deliver(j);
     }
+    stats_.kv_blocks_used.store(blocks_->used_blocks(), std::memory_order_relaxed);
 }
 
 }  // namespace microvllm

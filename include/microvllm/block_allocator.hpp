@@ -74,6 +74,56 @@ private:
     std::vector<std::uint32_t> refcounts_;  // indexed by BlockId
 };
 
+// Maps a hashed prompt prefix to the sequence currently holding its KV cache.
+//
+// Prefix sharing exists because chat traffic is highly redundant: every request in a
+// conversation, or every request behind the same system prompt, re-sends the same leading
+// tokens. Prefilling them again is pure waste, and prefill is the compute-bound half of
+// inference. A hit lets the new sequence copy that KV rather than recompute it.
+//
+// Keyed on a rolling hash of the token prefix, granular to whole blocks: a partial block
+// cannot be shared, since the sequence must be free to write the rest of it.
+//
+// SCOPE, STATED PLAINLY: an entry names a *live* sequence, so sharing only happens between
+// sequences that overlap in time. When the donor retires its KV is reclaimed and the entry
+// is evicted, so a request arriving after every previous one has finished gets no benefit.
+// That covers concurrent traffic behind a shared system prompt, but not the sequential
+// case, which is where prefix caching is most often pitched.
+//
+// Retaining a donor past retirement would mean pinning its llama.cpp sequence and blocks
+// (an LRU of "donor" slots that are evicted on demand). That is the natural next step and
+// is deliberately not claimed here.
+class PrefixCache {
+public:
+    struct Entry {
+        SeqId                seq;       // sequence whose KV holds this prefix
+        std::uint32_t        n_tokens;  // tokens covered
+        std::vector<BlockId> blocks;
+    };
+
+    // Hash the first `n_tokens` of `tokens`. Whole-block granularity, so the returned
+    // hash covers exactly floor(n_tokens / block_size) * block_size tokens.
+    [[nodiscard]] static std::uint64_t hash_prefix(std::span<const Token> tokens,
+                                                   std::uint32_t          n_tokens);
+
+    // Longest cached prefix of `tokens`, or nullopt. Checks progressively shorter
+    // block-aligned prefixes so a partial match still helps.
+    [[nodiscard]] std::optional<Entry> find_longest(std::span<const Token> tokens,
+                                                    std::uint32_t block_size) const;
+
+    void insert(std::uint64_t hash, Entry entry);
+
+    // Drop every entry owned by `seq`. Called when that sequence's cache goes away, since
+    // the entry names a live sequence whose KV is about to stop existing.
+    void evict_sequence(SeqId seq);
+
+    [[nodiscard]] std::size_t size() const { return entries_.size(); }
+    void clear() { entries_.clear(); }
+
+private:
+    std::unordered_map<std::uint64_t, Entry> entries_;
+};
+
 // One sequence's page table: the blocks backing its KV cache, in logical order.
 //
 // A sequence grows one token at a time, but blocks are only taken when it crosses a block

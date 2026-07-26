@@ -238,12 +238,83 @@ not have had to.
 
 ---
 
+## Phase 5 — KV-cache budget: admission control and preemption
+
+A 0.5B model on this hardware cannot exhaust its own KV cache by accident (~12 KB/token
+means 4096 tokens is under 50 MB), so `--kv-blocks` exists to constrain the pool
+deliberately and make the behaviour observable. That is the point of the flag, not a
+workaround.
+
+Real model, `--batch-size 4 --ctx 1024 --block-size 16`, 12 concurrent requests at
+concurrency 8, 32 output tokens each:
+
+| Pool | Requests OK | Admissions deferred | Preemptions | p50 latency |
+|---|---:|---:|---:|---:|
+| 40 blocks (640 tok) | 12 / 12 | 0 | 0 | 2.75 s |
+| **10 blocks (160 tok)** | **12 / 12** | **18** | **3** | 5.46 s |
+
+The 40-block pool comfortably holds the working set, so neither mechanism engages. At 10
+blocks the pool is genuinely oversubscribed and both fire — yet **every request still
+returns correctly**, just more slowly. `requests_admitted_total` reads 15 against 12
+completions: the three extra admissions are preempted sequences being readmitted and
+recomputed.
+
+That is the property worth having. A cache budget is only useful if exceeding it degrades
+throughput instead of producing errors, and the honest way to show that is to squeeze the
+pool until the mechanisms visibly engage and then check that correctness held.
+
+### Three bugs, all of which presented as hangs
+
+Worth recording because they are the substance of the phase, and none was a typo.
+
+1. **Deferred and preempted requests were handed back to the `RequestQueue`.** A normal
+   queue close then stranded them as errors. The flaw was architectural, not local: once
+   the scheduler takes a request from the queue it owns it, so deferred work now waits in
+   a scheduler-local pending list.
+
+2. **Making room for a starved sequence could evict that same sequence**, which was then
+   readmitted, grew, and was evicted again. `preempt_one` now takes an `except` it will
+   never evict.
+
+3. **Two sequences alternately evicting each other.** Instrumenting the loop showed
+   **25,000 preemptions** with the pool oscillating 4/8 → 8/8 → 4/8 and neither sequence
+   making progress. Root cause: admission reserved only the prompt's blocks, leaving no
+   room to *grow*, so a newcomer immediately starved an incumbent, which preempted the
+   newcomer, forever. Fixed with an **admission watermark** — one spare block per active
+   sequence plus one for the newcomer — which is the standard remedy rather than a patch.
+   The first sequence is exempt, since with nothing running there is no one to starve.
+
+The first two were found by tests; the third only by tracing the loop. Reasoning about it
+from the code had produced a plausible but wrong explanation twice.
+
+### Prefix caching: what works, and what does not
+
+Sharing is implemented end to end — hashed block-aligned prefixes, refcounted blocks,
+mirrored into the backend with `llama_memory_seq_cp` so the saving is real work avoided
+rather than bookkeeping. Unit tests assert prefill tokens actually drop and that output is
+byte-identical with sharing on versus off.
+
+**It only helps sequences that overlap in time.** A cache entry names a *live* donor
+sequence; when that donor retires, its KV is reclaimed and the entry is evicted. A
+sequential real-model run — eight requests behind the same long system prompt, sent one
+after another — recorded **zero hits**, because each donor had already finished before the
+next request arrived.
+
+This is stated rather than smoothed over because sequential reuse is the case prefix
+caching is usually pitched on. Retaining donors past retirement means pinning their
+llama.cpp sequence and blocks in an LRU of donor slots, evicted on demand. That is the
+natural next step and is deliberately not claimed as done.
+
+---
+
 ## Planned measurements
 
 - ~~**Phase 3** — throughput vs. batch size (1/4/8/16/32), locating the plateau~~ ✅ above
 - ~~**Phase 4** — continuous vs. static under mixed load~~ ✅ above
-- **Phase 5** — KV utilization and preemption counts under a constrained `--kv-blocks` budget;
-  TTFT with and without prefix sharing
+- ~~**Phase 5** — KV utilization and preemption counts under a constrained `--kv-blocks`
+  budget~~ ✅ above
+- **Deferred (Phase 5)** — TTFT with and without prefix sharing, which needs donor
+  retention first (see above); today the sequential case has nothing to share
 - **Deferred** — TTFT and inter-token-latency percentiles need the streaming endpoint to be
   measured client-side, and Poisson arrival sweeps need a load generator that models arrival
   rate rather than fixed concurrency. Both are worth doing; neither changes the comparison above.

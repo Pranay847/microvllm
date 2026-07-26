@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <vector>
@@ -29,6 +30,11 @@ struct SchedulerConfig {
     // eviction are observable on hardware whose cache cannot otherwise be exhausted.
     std::uint32_t kv_blocks  = 0;
     std::uint32_t block_size = 16;  // tokens per block, matching vLLM's default
+
+    // Share KV cache between requests with a common prompt prefix. Chat traffic is highly
+    // redundant -- the same system prompt or conversation history leads every request --
+    // and prefill is the compute-bound half of inference, so recomputing it is pure waste.
+    bool prefix_caching = true;
 
     // Prompt tokens one sequence may submit per step. A long prompt admitted whole would
     // stall every decode sharing that step, so prefill is spread across steps instead.
@@ -72,11 +78,17 @@ public:
 
     // Observable scheduling state, for /metrics and for tests asserting that admission
     // control and preemption actually fired rather than merely not crashing.
+    //
+    // stats() is safe to call from any thread: the counters are atomic internally and
+    // this returns a plain snapshot. /metrics is served on an HTTP thread while the
+    // scheduler thread is updating them, so a non-atomic read here would be a data race.
     struct Stats {
         std::uint64_t admitted    = 0;
         std::uint64_t completed   = 0;
         std::uint64_t preemptions = 0;  // sequences evicted to free cache, then requeued
         std::uint64_t deferred    = 0;  // admissions delayed because the pool was full
+        std::uint64_t prefix_hits = 0;  // requests that inherited a cached prompt prefix
+        std::uint64_t prefix_tokens_saved = 0;  // prompt tokens not prefilled thanks to hits
         std::uint32_t kv_blocks_total = 0;
         std::uint32_t kv_blocks_used  = 0;
     };
@@ -119,7 +131,20 @@ private:
     RequestQueue&                   queue_;
     SchedulerConfig                 config_;
     std::unique_ptr<BlockAllocator> blocks_;
-    Stats                           stats_{};
+    PrefixCache                     prefix_cache_;
+
+    // Written only by the scheduler thread, read by HTTP threads via stats().
+    struct AtomicStats {
+        std::atomic<std::uint64_t> admitted{0};
+        std::atomic<std::uint64_t> completed{0};
+        std::atomic<std::uint64_t> preemptions{0};
+        std::atomic<std::uint64_t> deferred{0};
+        std::atomic<std::uint64_t> prefix_hits{0};
+        std::atomic<std::uint64_t> prefix_tokens_saved{0};
+        std::atomic<std::uint32_t> kv_blocks_total{0};
+        std::atomic<std::uint32_t> kv_blocks_used{0};
+    };
+    AtomicStats stats_;
 };
 
 }  // namespace microvllm

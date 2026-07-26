@@ -1,5 +1,6 @@
 #include "microvllm/mock_engine.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <thread>
 
@@ -64,6 +65,10 @@ std::vector<GenStep> MockModelEngine::decode(std::span<const BatchItem> batch) {
         }
         SeqState& state = it->second;
 
+        if (state.gen_index == 0) {
+            tokens_prefilled_ += item.tokens.size();  // work a shared prefix would avoid
+        }
+
         // Echo mode: accumulate the prompt (minus BOS) as this sequence's response.
         //
         // This runs for EVERY item, before the sampling check, because that is what a
@@ -96,6 +101,24 @@ std::vector<GenStep> MockModelEngine::decode(std::span<const BatchItem> batch) {
 
 void MockModelEngine::release_sequence(SeqId seq) {
     sequences_.erase(seq);
+}
+
+void MockModelEngine::copy_sequence(SeqId src, SeqId dst, Pos n_tokens) {
+    if (n_tokens <= 0 || src == dst) {
+        return;
+    }
+    const auto s = sequences_.find(src);
+    const auto d = sequences_.find(dst);
+    if (s == sequences_.end() || d == sequences_.end()) {
+        return;
+    }
+    // Model the real effect: `dst` inherits the prefix without prefilling it. In echo
+    // mode that means adopting the copied prompt tokens, exactly as a real backend
+    // inherits their KV cells.
+    const auto take = std::min(static_cast<std::size_t>(n_tokens), s->second.echo.size());
+    d->second.echo.assign(s->second.echo.begin(), s->second.echo.begin() +
+                                                      static_cast<std::ptrdiff_t>(take));
+    tokens_copied_ += take;
 }
 
 }  // namespace microvllm

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -32,6 +33,15 @@ public:
 
     SequenceState(const SequenceState&)            = delete;
     SequenceState& operator=(const SequenceState&) = delete;
+
+    // Declare that the first `n_tokens` of the prompt are already in this sequence's KV
+    // cache (inherited from a shared prefix), so prefill starts after them instead of at
+    // zero. Must be called before the first prefill chunk.
+    //
+    // The count is recorded in Usage::cached_prompt_tokens, which is a *subset* of
+    // prompt_tokens rather than an addition -- the tokens were still part of the request,
+    // they just did not have to be recomputed.
+    void adopt_cached_prefix(std::size_t n_tokens);
 
     // Prompt tokens not yet submitted to the engine. Zero once prefill is complete.
     [[nodiscard]] std::size_t prefill_remaining() const;
@@ -66,6 +76,7 @@ public:
     void finish();
 
     [[nodiscard]] SeqId seq() const { return seq_; }
+    [[nodiscard]] std::span<const Token> prompt() const { return prompt_; }
     [[nodiscard]] bool finished() const { return finished_; }
     [[nodiscard]] FinishReason reason() const { return reason_; }
     [[nodiscard]] const Usage& usage() const { return usage_; }

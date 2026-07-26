@@ -38,6 +38,14 @@ public:
     void begin_sequence(SeqId seq, const SamplingParams& params) override;
     [[nodiscard]] std::vector<GenStep> decode(std::span<const BatchItem> batch) override;
     void release_sequence(SeqId seq) override;
+    void copy_sequence(SeqId src, SeqId dst, Pos n_tokens) override;
+
+    // How many prompt tokens were copied rather than prefilled, across all sequences.
+    // Tests use this to prove prefix sharing actually avoided work instead of merely
+    // bookkeeping refcounts.
+    [[nodiscard]] std::uint64_t tokens_copied() const { return tokens_copied_; }
+    // Prompt tokens actually submitted to decode(), i.e. genuinely prefilled.
+    [[nodiscard]] std::uint64_t tokens_prefilled() const { return tokens_prefilled_; }
 
     // Token id reserved for end-of-generation (outside the 0..255 byte range).
     static constexpr Token kEosToken = 256;
@@ -50,9 +58,11 @@ private:
         std::vector<Token> echo;           // captured prompt (echo mode only)
     };
 
-    Config                             config_;
-    std::vector<Token>                 response_tokens_;  // config_.response as byte-tokens
+    Config                              config_;
+    std::vector<Token>                  response_tokens_;  // config_.response as byte-tokens
     std::unordered_map<SeqId, SeqState> sequences_;
+    std::uint64_t                       tokens_copied_    = 0;
+    std::uint64_t                       tokens_prefilled_ = 0;
 };
 
 }  // namespace microvllm

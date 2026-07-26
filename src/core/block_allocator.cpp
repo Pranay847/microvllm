@@ -65,6 +65,49 @@ std::uint32_t BlockAllocator::refcount(BlockId block) const {
 }
 
 // ---------------------------------------------------------------------------
+// PrefixCache
+// ---------------------------------------------------------------------------
+std::uint64_t PrefixCache::hash_prefix(std::span<const Token> tokens, std::uint32_t n_tokens) {
+    // FNV-1a. Not cryptographic, but prefix hashes only need to be fast and well spread;
+    // a collision is guarded against by verifying the token match at the call site.
+    std::uint64_t h = 1469598103934665603ULL;
+    const auto    n = std::min<std::size_t>(n_tokens, tokens.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        h ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(tokens[i]));
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+std::optional<PrefixCache::Entry> PrefixCache::find_longest(std::span<const Token> tokens,
+                                                            std::uint32_t block_size) const {
+    if (block_size == 0 || tokens.empty()) {
+        return std::nullopt;
+    }
+    // Only whole blocks can be shared: the sequence must be free to write into its last,
+    // partially-filled block. Try longest first so a hit saves as much prefill as possible.
+    const auto max_blocks = static_cast<std::uint32_t>(tokens.size() / block_size);
+    for (std::uint32_t nb = max_blocks; nb > 0; --nb) {
+        const std::uint32_t n_tokens = nb * block_size;
+        const auto          it       = entries_.find(hash_prefix(tokens, n_tokens));
+        if (it != entries_.end() && it->second.n_tokens == n_tokens) {
+            return it->second;
+        }
+    }
+    return std::nullopt;
+}
+
+void PrefixCache::insert(std::uint64_t hash, Entry entry) {
+    entries_[hash] = std::move(entry);
+}
+
+void PrefixCache::evict_sequence(SeqId seq) {
+    for (auto it = entries_.begin(); it != entries_.end();) {
+        it = it->second.seq == seq ? entries_.erase(it) : std::next(it);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BlockTable
 // ---------------------------------------------------------------------------
 bool BlockTable::ensure_capacity(std::uint32_t n_tokens) {

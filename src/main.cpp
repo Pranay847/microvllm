@@ -31,6 +31,9 @@ struct Args {
     std::size_t  queue_depth = 64;
     std::size_t  batch_size  = 8;
     std::size_t  prefill_chunk = 128;
+    std::uint32_t kv_blocks    = 0;
+    std::uint32_t block_size   = 16;
+    bool          no_prefix_cache = false;
     microvllm::BatchingMode mode = microvllm::BatchingMode::kContinuous;
 };
 
@@ -53,6 +56,10 @@ struct Args {
                  "  --scheduler <m>   continuous (default) | static\n"
                  "  --prefill-chunk <n>  prompt tokens per sequence per step (default 128,\n"
                  "                    0 = submit whole prompts; continuous mode only)\n"
+                 "  --kv-blocks <n>   KV-cache budget in blocks (default: derived from --ctx).\n"
+                 "                    Lower it to exercise admission control and preemption\n"
+                 "  --block-size <n>  tokens per KV block (default 16)\n"
+                 "  --no-prefix-cache disable KV sharing between common prompt prefixes\n"
                  "  --quiet           silence llama.cpp info logging\n"
                  "  --help\n",
                  microvllm::kVersion, prog, prog);
@@ -108,6 +115,14 @@ Args parse_args(int argc, char** argv) {
         } else if (std::strcmp(arg, "--prefill-chunk") == 0) {
             a.prefill_chunk =
                 static_cast<std::size_t>(std::atoi(need_value(argc, argv, i, argv[0])));
+        } else if (std::strcmp(arg, "--kv-blocks") == 0) {
+            a.kv_blocks =
+                static_cast<std::uint32_t>(std::atoi(need_value(argc, argv, i, argv[0])));
+        } else if (std::strcmp(arg, "--block-size") == 0) {
+            a.block_size =
+                static_cast<std::uint32_t>(std::atoi(need_value(argc, argv, i, argv[0])));
+        } else if (std::strcmp(arg, "--no-prefix-cache") == 0) {
+            a.no_prefix_cache = true;
         } else if (std::strcmp(arg, "--quiet") == 0) {
             a.quiet = true;
         } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
@@ -133,7 +148,10 @@ int main(int argc, char** argv) {
                                              .max_queue_depth = args.queue_depth,
                                              .max_batch_size  = args.batch_size,
                                              .mode            = args.mode,
-                                             .prefill_chunk   = args.prefill_chunk};
+                                             .prefill_chunk   = args.prefill_chunk,
+                                             .kv_blocks       = args.kv_blocks,
+                                             .block_size      = args.block_size,
+                                             .prefix_caching  = !args.no_prefix_cache};
 
     if (args.has_mock) {
         std::printf("microvllm %s (mock engine%s)\n", microvllm::kVersion,

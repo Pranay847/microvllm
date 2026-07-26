@@ -83,6 +83,7 @@ struct ThrowingEngine final : IModelEngine {
         throw std::runtime_error("boom");
     }
     void release_sequence(SeqId) override { ++released; }
+    void copy_sequence(SeqId, SeqId, Pos) override {}
     int released = 0;
 };
 
