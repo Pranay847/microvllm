@@ -19,6 +19,7 @@ struct Scheduler::Job {
     Request                        request;
     std::shared_ptr<ITokenSink>    sink;   // buffered or streaming; kept alive here
     std::unique_ptr<SequenceState> state;
+    std::unique_ptr<BlockTable>    blocks;  // this sequence's KV-cache page table
 };
 
 void Scheduler::deliver(Job& job) {
@@ -81,6 +82,21 @@ Scheduler::Scheduler(IModelEngine& engine, RequestQueue& queue, SchedulerConfig 
                      config_.max_batch_size, n_seq_max, n_seq_max);
         config_.max_batch_size = n_seq_max;
     }
+    // Size the KV budget. Default: exactly what the backend can hold, so the allocator
+    // mirrors reality rather than inventing a limit. A smaller --kv-blocks constrains it
+    // deliberately, which is how admission control and preemption become observable on
+    // hardware whose cache a 0.5B model cannot otherwise exhaust.
+    const std::uint32_t block_size = config_.block_size == 0 ? 16 : config_.block_size;
+    std::uint32_t       pool       = config_.kv_blocks;
+    if (pool == 0) {
+        const std::uint32_t cells = engine_.caps().n_ctx > 0 ? engine_.caps().n_ctx : 4096;
+        pool = (cells + block_size - 1) / block_size;
+    }
+    config_.block_size = block_size;
+    config_.kv_blocks  = pool;
+    blocks_            = std::make_unique<BlockAllocator>(pool, block_size);
+    stats_.kv_blocks_total.store(pool, std::memory_order_relaxed);
+
     if (config_.max_batch_size == 0) {
         config_.max_batch_size = 1;
     }
@@ -125,10 +141,80 @@ void Scheduler::run_static() {
     }
 }
 
+Scheduler::Stats Scheduler::stats() const {
+    Stats s;
+    s.admitted            = stats_.admitted.load(std::memory_order_relaxed);
+    s.completed           = stats_.completed.load(std::memory_order_relaxed);
+    s.preemptions         = stats_.preemptions.load(std::memory_order_relaxed);
+    s.deferred            = stats_.deferred.load(std::memory_order_relaxed);
+    s.prefix_hits         = stats_.prefix_hits.load(std::memory_order_relaxed);
+    s.prefix_tokens_saved = stats_.prefix_tokens_saved.load(std::memory_order_relaxed);
+    s.kv_blocks_total     = stats_.kv_blocks_total.load(std::memory_order_relaxed);
+    s.kv_blocks_used      = stats_.kv_blocks_used.load(std::memory_order_relaxed);
+    return s;
+}
+
 void Scheduler::retire(Job& job) {
     job.state->finish();  // idempotent
+    // A cache entry names a live sequence whose KV is about to stop existing, so it must
+    // go before the sequence does -- otherwise a later hit would copy from a slot that has
+    // been recycled by an unrelated request.
+    prefix_cache_.evict_sequence(job.state->seq());
+    if (job.blocks) {
+        job.blocks->release();  // return this sequence's cache to the pool
+    }
     engine_.release_sequence(job.state->seq());
+    stats_.completed.fetch_add(1, std::memory_order_relaxed);
     deliver(job);
+}
+
+// Move a Job's request back out so it can be retried later. Used when a sequence is
+// deferred at admission or preempted mid-flight: the promise, cancel flag, and sink
+// travel with it, so the client sees a slower response rather than an error.
+Request Scheduler::reclaim(Job& job) {
+    Request out;
+    out.id     = job.request.id;
+    out.spec   = std::move(job.request.spec);
+    out.cancel = std::move(job.request.cancel);
+    out.sink   = std::move(job.request.sink);
+    out.result = std::move(job.request.result);
+    return out;
+}
+
+bool Scheduler::preempt_one(std::vector<std::unique_ptr<Job>>& active,
+                            std::vector<SeqId>&                free_slots,
+                            std::vector<Request>&              pending,
+                            const Job*                         except) {
+    // LIFO: evict the most recently admitted sequence. It has the least work invested, so
+    // discarding it wastes the least compute, and older sequences closer to finishing keep
+    // their progress rather than being starved. This is vLLM's recompute preemption.
+    //
+    // `except` is never evicted. Without it, making room for a starved sequence can evict
+    // that same sequence, which is then readmitted, grows, and is evicted again -- a
+    // livelock that looks exactly like a hang.
+    for (auto it = active.rbegin(); it != active.rend(); ++it) {
+        Job& job = **it;
+        if (job.state->finished() || &job == except) {
+            continue;
+        }
+
+        // The request goes to the FRONT of pending so it is retried before newer
+        // arrivals -- it has already waited once and partially run, and sending it to the
+        // back would risk starving it behind a stream of new work. It is recomputed from
+        // scratch on readmission, which is vLLM's recompute preemption.
+        Request requeued = reclaim(job);
+
+        prefix_cache_.evict_sequence(job.state->seq());  // its KV is about to disappear
+        job.blocks->release();
+        engine_.release_sequence(job.state->seq());
+        free_slots.push_back(job.state->seq());
+
+        active.erase(std::next(it).base());
+        pending.insert(pending.begin(), std::move(requeued));
+        stats_.preemptions.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
 }
 
 // Continuous batching: the batch is rebuilt every step rather than run to completion.
@@ -151,27 +237,104 @@ void Scheduler::run_continuous() {
     }
 
     std::vector<std::unique_ptr<Job>> active;
+    std::vector<Request>              pending;  // owned by the scheduler, awaiting capacity
     const std::size_t n_batch = engine_.caps().n_batch;
 
     while (true) {
-        // --- 1. admit ---------------------------------------------------------------
-        while (!free_slots.empty()) {
-            // Block only when there is nothing in flight; otherwise a wait here would
-            // stall sequences that are mid-generation.
-            std::optional<Request> req = active.empty() ? queue_.pop() : queue_.try_pop();
+        // --- 1. take work from the queue ---------------------------------------------
+        // Once a request leaves the queue the scheduler owns it: a deferred or preempted
+        // request waits in `pending` rather than being handed back, so a queue close (a
+        // normal shutdown) can never strand work that was already accepted.
+        while (pending.size() + active.size() < config_.max_batch_size) {
+            const bool idle = active.empty() && pending.empty();
+            // Block only when nothing is in flight; otherwise waiting here would stall
+            // sequences that are mid-generation.
+            std::optional<Request> req = idle ? queue_.pop() : queue_.try_pop();
             if (!req) {
-                if (active.empty()) {
-                    return;  // queue closed and drained, nothing left to finish
-                }
                 break;
             }
+            pending.push_back(std::move(*req));
+        }
+        if (active.empty() && pending.empty()) {
+            return;  // queue closed and drained, nothing left to finish
+        }
+
+        // --- 2. admit what fits ------------------------------------------------------
+        while (!pending.empty() && !free_slots.empty()) {
             const SeqId slot = free_slots.back();
+            auto        job  = make_job(engine_, std::move(pending.front()), slot);
+
+            // Admission control, with headroom. Reserving only the prompt's blocks is not
+            // enough: every running sequence needs at least one more block to cross its
+            // next boundary, so admitting into a pool with no slack means the newcomer
+            // immediately starves someone, that someone preempts the newcomer, and the
+            // pair thrash without either making progress. Requiring one spare block per
+            // active sequence (plus one for the newcomer) guarantees the batch can always
+            // advance a step before pressure returns.
+            //
+            // The first sequence is exempt: if nothing is running there is no one to
+            // starve, and refusing it would mean never running anything.
+            job->blocks = std::make_unique<BlockTable>(*blocks_);
+            const std::uint32_t want =
+                blocks_->blocks_for(job->state->usage().prompt_tokens);
+            const std::uint32_t headroom =
+                active.empty() ? 0 : static_cast<std::uint32_t>(active.size()) + 1;
+            const bool fits = job->state->finished() ||
+                              (blocks_->free_blocks() >= want + headroom &&
+                               job->blocks->ensure_capacity(job->state->usage().prompt_tokens));
+            if (!fits) {
+                if (active.empty()) {
+                    // Nothing is running, so no amount of waiting will free capacity:
+                    // this request simply cannot fit the pool. Say so rather than
+                    // deferring it forever.
+                    job->state->fail(
+                        "KV cache exhausted: prompt needs " +
+                            std::to_string(blocks_->blocks_for(job->state->usage().prompt_tokens)) +
+                            " blocks but the pool holds " +
+                            std::to_string(blocks_->total_blocks()),
+                        FinishReason::kContextOverflow);
+                    job->state->finish();
+                    engine_.release_sequence(slot);
+                    pending.erase(pending.begin());
+                    deliver(*job);
+                    continue;
+                }
+                // Put it back untouched and let running sequences drain first.
+                engine_.release_sequence(slot);
+                pending.front() = reclaim(*job);
+                stats_.deferred.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+
+            // Prefix sharing: if another live sequence already holds the KV for a leading
+            // run of this prompt, inherit it rather than prefilling it again. The copy is
+            // mirrored into the backend (llama_memory_seq_cp), so the saving is real work
+            // avoided -- not just refcount bookkeeping.
+            if (config_.prefix_caching && !job->state->finished()) {
+                const auto hit = prefix_cache_.find_longest(job->state->prompt(),
+                                                            blocks_->block_size());
+                if (hit && hit->seq != job->state->seq()) {
+                    engine_.copy_sequence(hit->seq, job->state->seq(),
+                                          static_cast<Pos>(hit->n_tokens));
+                    job->blocks->adopt_shared_prefix(hit->blocks, hit->n_tokens);
+                    job->state->adopt_cached_prefix(hit->n_tokens);
+                    stats_.prefix_hits.fetch_add(1, std::memory_order_relaxed);
+                    stats_.prefix_tokens_saved.fetch_add(hit->n_tokens, std::memory_order_relaxed);
+                }
+            }
+
+            pending.erase(pending.begin());
             free_slots.pop_back();
-            active.push_back(make_job(engine_, std::move(*req), slot));
+            stats_.admitted.fetch_add(1, std::memory_order_relaxed);
+            active.push_back(std::move(job));
         }
         if (active.empty()) {
             continue;
         }
+
+        // Sequences that could not get the block they need this step; resolved after the
+        // accept loop by preempting someone (which may be one of them).
+        std::vector<Job*> grew_short;
 
         try {
             // --- 2. build the mixed batch -------------------------------------------
@@ -222,6 +385,35 @@ void Scheduler::run_continuous() {
                     Job& job = *sampling[k];
                     if (!job.state->accept(engine_, steps.at(k))) {
                         job.state->finish();
+                        continue;
+                    }
+                    // The sequence grew by a token. Most steps stay inside the block it
+                    // already holds; crossing a boundary needs another one.
+                    const std::uint32_t needed = job.state->usage().prompt_tokens +
+                                                 job.state->usage().completion_tokens;
+                    if (!job.blocks->ensure_capacity(needed)) {
+                        grew_short.push_back(&job);
+                        continue;
+                    }
+
+                    // Publish this sequence's prompt prefix once prefill is done, so
+                    // later requests sharing it can inherit the KV instead of recomputing
+                    // it. Only whole blocks are offered -- the last, partially-filled
+                    // block is still being written and cannot be shared.
+                    if (config_.prefix_caching && !job.state->prefilling()) {
+                        const auto prompt   = job.state->prompt();
+                        const auto bs       = blocks_->block_size();
+                        const auto n_blocks = static_cast<std::uint32_t>(prompt.size() / bs);
+                        if (n_blocks > 0 && job.blocks->n_blocks() >= n_blocks) {
+                            const std::uint32_t n_tokens = n_blocks * bs;
+                            PrefixCache::Entry  entry;
+                            entry.seq      = job.state->seq();
+                            entry.n_tokens = n_tokens;
+                            entry.blocks.assign(job.blocks->blocks().begin(),
+                                                job.blocks->blocks().begin() + n_blocks);
+                            prefix_cache_.insert(PrefixCache::hash_prefix(prompt, n_tokens),
+                                                 std::move(entry));
+                        }
                     }
                 }
             }
@@ -245,6 +437,58 @@ void Scheduler::run_continuous() {
                 ++it;
             }
         }
+
+        // --- resolve cache exhaustion ------------------------------------------------
+        // Retirement above may already have freed enough. If not, evict LIFO until every
+        // starved sequence can grow. Preemption is the escape valve that lets the server
+        // stay correct under a cache budget instead of failing when it runs out.
+        for (Job* starved : grew_short) {
+            const auto it = std::find_if(active.begin(), active.end(),
+                                         [&](const auto& j) { return j.get() == starved; });
+            if (it == active.end()) {
+                continue;  // already retired or preempted
+            }
+            const std::uint32_t needed = starved->state->usage().prompt_tokens +
+                                         starved->state->usage().completion_tokens;
+
+            // A sequence larger than the entire pool can never be satisfied, no matter
+            // who is evicted. Say so rather than evicting everyone else pointlessly.
+            if (blocks_->blocks_for(needed) > blocks_->total_blocks()) {
+                starved->state->fail(
+                    "KV cache exhausted: sequence needs " +
+                        std::to_string(blocks_->blocks_for(needed)) +
+                        " blocks but the pool holds only " +
+                        std::to_string(blocks_->total_blocks()),
+                    FinishReason::kContextOverflow);
+                starved->state->finish();
+                continue;
+            }
+
+            // Otherwise evicting others is guaranteed to make room eventually: with every
+            // other sequence gone the pool holds total - starved's own blocks free, which
+            // covers the shortfall exactly because needed fits the pool. So this loop
+            // terminates -- either it fits, or there is nothing left to evict.
+            while (!starved->blocks->ensure_capacity(needed)) {
+                if (!preempt_one(active, free_slots, pending, /*except=*/starved)) {
+                    break;
+                }
+            }
+        }
+
+        // A preemption or forced failure may have finished sequences; sweep once more.
+        for (auto it = active.begin(); it != active.end();) {
+            if ((*it)->state->finished()) {
+                free_slots.push_back((*it)->state->seq());
+                retire(**it);
+                it = active.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        // Publish pool utilization from this thread. BlockAllocator is not thread-safe, so
+        // /metrics must read a snapshot rather than reach into the allocator itself.
+        stats_.kv_blocks_used.store(blocks_->used_blocks(), std::memory_order_relaxed);
     }
 }
 
@@ -258,7 +502,19 @@ void Scheduler::run_batch(std::vector<Request> batch) {
     std::vector<std::unique_ptr<Job>> jobs;
     jobs.reserve(batch.size());
     for (std::size_t i = 0; i < batch.size(); ++i) {
-        jobs.push_back(make_job(engine_, std::move(batch[i]), static_cast<SeqId>(i)));
+        auto job    = make_job(engine_, std::move(batch[i]), static_cast<SeqId>(i));
+        job->blocks = std::make_unique<BlockTable>(*blocks_);
+        // Static batching cannot preempt (the batch is fixed once it starts), so a
+        // sequence that will not fit the pool is rejected here rather than failing later.
+        if (!job->state->finished() &&
+            !job->blocks->ensure_capacity(job->state->usage().prompt_tokens +
+                                          job->request.spec.max_tokens)) {
+            job->state->fail("KV cache exhausted: not enough blocks for this batch",
+                             FinishReason::kContextOverflow);
+        } else {
+            stats_.admitted.fetch_add(1, std::memory_order_relaxed);
+        }
+        jobs.push_back(std::move(job));
     }
 
     try {
@@ -348,8 +604,13 @@ void Scheduler::run_batch(std::vector<Request> batch) {
     for (auto& jp : jobs) {
         Job& j = *jp;
         j.state->finish();  // idempotent; covers any sequence not yet notified
+        if (j.blocks) {
+            j.blocks->release();  // return this batch's cache before the next one forms
+        }
+        stats_.completed.fetch_add(1, std::memory_order_relaxed);
         deliver(j);
     }
+    stats_.kv_blocks_used.store(blocks_->used_blocks(), std::memory_order_relaxed);
 }
 
 }  // namespace microvllm

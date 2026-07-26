@@ -47,6 +47,14 @@ Pos SequenceState::feed_pos() const {
     return static_cast<Pos>(prompt_.size()) + static_cast<Pos>(usage_.completion_tokens) - 1;
 }
 
+void SequenceState::adopt_cached_prefix(std::size_t n_tokens) {
+    // Never adopt the entire prompt: the final prefill chunk is what samples the first
+    // token, so at least one token must still go through the engine.
+    const std::size_t take = std::min(n_tokens, prompt_.empty() ? 0 : prompt_.size() - 1);
+    prefilled_                   = take;
+    usage_.cached_prompt_tokens  = static_cast<std::uint32_t>(take);
+}
+
 std::size_t SequenceState::prefill_remaining() const {
     return prompt_.size() - prefilled_;
 }

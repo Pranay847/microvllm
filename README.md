@@ -5,12 +5,14 @@ serving engines fast under concurrent load — **continuous batching**, **reques
 and a **block-based KV-cache allocator with admission control** — around llama.cpp as the
 tensor backend.
 
-> **Status: Phase 4 complete.** A concurrent HTTP server serves a real model with
-> **continuous batching** — sequences are admitted and retired every step, with chunked
-> prefill and SSE streaming. Batching gives **2.06×** the single-sequence throughput, and
-> continuous scheduling cuts short-request p50 latency by **60%** under mixed-length load
-> ([benchmarks](docs/benchmarks.md)). The paged KV-cache allocator (Phase 5) is next. See
-> [docs/architecture.md](docs/architecture.md) for the design.
+> **Status: Phase 5 complete.** A concurrent HTTP server serving a real model with
+> **continuous batching** over a **block-based KV-cache allocator**: sequences are admitted
+> and retired every step, prefill is chunked, output streams over SSE, and the cache runs to
+> a fixed budget with admission control, LIFO preemption, and prefix sharing.
+> Batching gives **2.06×** the single-sequence throughput; continuous scheduling cuts
+> short-request p50 latency by **60%** under mixed-length load; a deliberately squeezed
+> cache pool degrades throughput instead of failing
+> ([benchmarks](docs/benchmarks.md)). See [docs/architecture.md](docs/architecture.md).
 
 ## What this is, and what it isn't
 

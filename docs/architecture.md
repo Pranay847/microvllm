@@ -150,11 +150,31 @@ memory, not a replacement for it.
 **Preemption.** When a running sequence needs another block and the pool is empty, the
 most-recently-admitted sequence is evicted, its blocks freed, and it is requeued to be
 recomputed on readmission. LIFO order protects the progress of older, closer-to-done requests
-from being thrown away. This mirrors vLLM's recompute preemption mode.
+from being thrown away. This mirrors vLLM's recompute preemption mode. Two rules keep it from
+degenerating, both learned the hard way (see [benchmarks.md](benchmarks.md)):
+
+- **Never evict the sequence you are making room for.** Otherwise it is readmitted, grows,
+  and is evicted again — a livelock indistinguishable from a hang.
+- **Admit with headroom.** Reserving only a request's prompt blocks leaves nothing for it to
+  grow into, so a newcomer immediately starves an incumbent, which preempts the newcomer, and
+  the pair thrash without progressing. Admission therefore requires one spare block per
+  active sequence plus one for the newcomer.
+
+**Once the scheduler takes a request, it owns it.** Deferred and preempted requests wait in a
+scheduler-local pending list rather than going back on the queue, so a normal shutdown cannot
+strand work the server had already accepted.
 
 **Why the budget is configurable.** Qwen2.5-0.5B uses roughly 12 KB of KV per token, so this
 hardware cannot exhaust the cache by accident. `--kv-blocks` exists so admission control,
 preemption, and eviction are observable and benchmarkable by design.
+
+**Prefix sharing, and its current limit.** Block-aligned prompt prefixes are hashed; a hit
+increfs the donor's blocks and mirrors the KV with `llama_memory_seq_cp`, so the new sequence
+prefills only its divergent suffix — real work avoided, not bookkeeping. But an entry names a
+*live* donor: when the donor retires its KV is reclaimed and the entry goes with it, so
+sharing only helps sequences that overlap in time. Sequential reuse, the case prefix caching
+is usually pitched on, gets nothing today. Retaining donors past retirement (an LRU of pinned
+donor slots, evicted on demand) is the next step and is not claimed as done.
 
 ## Benchmark methodology
 

@@ -84,6 +84,15 @@ public:
 
     // Release a sequence: free its sampler and its KV-cache slot. Idempotent.
     virtual void release_sequence(SeqId seq) = 0;
+
+    // Copy the KV cache for positions [0, n_tokens) from `src` into `dst`, so `dst` need
+    // not recompute that prefix. Backs prefix sharing: with llama.cpp this is
+    // llama_memory_seq_cp, which makes the cells shared rather than deep-copying them.
+    //
+    // This is what keeps prefix sharing honest. Without it the allocator could refcount
+    // blocks all it liked while the backend still recomputed every prompt, and the
+    // "saving" would be pure bookkeeping.
+    virtual void copy_sequence(SeqId src, SeqId dst, Pos n_tokens) = 0;
 };
 
 }  // namespace microvllm

@@ -37,6 +37,18 @@ std::optional<Request> RequestQueue::try_pop() {
     return req;
 }
 
+bool RequestQueue::push_front(Request& req) {
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_) {
+            return false;  // draining: the caller must resolve the request itself
+        }
+        queue_.push_front(std::move(req));
+    }
+    not_empty_.notify_one();
+    return true;
+}
+
 void RequestQueue::close() {
     {
         const std::lock_guard<std::mutex> lock(mutex_);

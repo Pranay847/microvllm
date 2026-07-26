@@ -12,8 +12,11 @@ struct ServerConfig {
     int          port            = 8080;
     std::size_t  max_queue_depth = 64;  // reject with 503 beyond this many waiting requests
     std::size_t  max_batch_size  = 8;   // sequences packed into one forward pass
-    BatchingMode mode            = BatchingMode::kContinuous;
-    std::size_t  prefill_chunk   = 128;  // prompt tokens one sequence may submit per step
+    BatchingMode  mode           = BatchingMode::kContinuous;
+    std::size_t   prefill_chunk  = 128;  // prompt tokens one sequence may submit per step
+    std::uint32_t kv_blocks      = 0;    // 0 = derive from the engine's context
+    std::uint32_t block_size     = 16;   // tokens per KV block
+    bool          prefix_caching = true;
 };
 
 // Serve POST /generate and GET /health against `engine`, blocking until the process
