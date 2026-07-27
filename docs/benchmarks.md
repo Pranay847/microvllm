@@ -287,7 +287,68 @@ Worth recording because they are the substance of the phase, and none was a typo
 The first two were found by tests; the third only by tracing the loop. Reasoning about it
 from the code had produced a plausible but wrong explanation twice.
 
-### Prefix caching: what works, and what does not
+## Donor retention: prefix caching for sequential traffic
+
+The limitation recorded below — sharing only helping requests that overlap in time — is now
+fixed. When a sequence retires holding a block-aligned prompt prefix, its KV is copied into a
+reserved **donor slot** and kept, so a request arriving long afterwards can still hit.
+
+Real model, 6 requests behind a shared ~700-token system prompt, sent **strictly one after
+another** (each returns before the next is sent, so nothing overlaps):
+
+| | Hits | Prompt tokens saved | Wall clock |
+|---|---:|---:|---:|
+| `--prefix-donors 0` | **0** | 0 | 9.9 s |
+| `--prefix-donors 4` | **4** | **704** | **4.4 s** |
+
+**2.25× faster** on precisely the case that previously scored zero. Five of six requests could
+in principle hit (the first has nothing to copy from); four did.
+
+Donors are bounded and evicted least-recently-used, and — the policy that matters — they are
+**reclaimed before any live sequence is preempted**. A donor is cache whose loss costs a
+recompute later; a live sequence is work already done. Cache yields to work.
+
+### The latent crash this uncovered
+
+Enabling retention made the server abort on the first real cache hit:
+
+```
+llama-kv-cache.cpp:502: GGML_ASSERT(is_full && "seq_cp() is only supported for full KV buffers")
+```
+
+`llama_memory_seq_cp` has two implementations. The **unified** one adds the destination
+sequence to the cells in `[p0, p1)` — exactly a partial prefix copy. The **per-stream** one
+copies whole buffers and asserts otherwise. The context was being created with llama.cpp's
+default (`kv_unified = false`), so every partial copy was an abort waiting to happen.
+
+**This bug shipped in Phase 5 and was invisible there.** Prefix sharing was implemented,
+unit-tested against the mock, and documented — but the sequential real-model test recorded
+zero hits, so `seq_cp` was never once called against the real backend. The feature was
+"working" in the only sense that nothing had exercised it. Fixing donor retention is what
+finally made a hit happen, and the hit crashed the server.
+
+Two lessons worth keeping: a passing test suite over a mock says nothing about a backend
+call the mock stands in for, and *zero* of something you expected to be non-zero is a result
+that deserves investigation rather than a caveat in the docs.
+
+`kv_unified = true` costs some efficiency when sequences do not share a large prefix, which
+is the documented trade. It is therefore tied to whether sharing is enabled rather than
+forced on: `--no-prefix-cache` keeps the faster per-stream cache.
+
+**Checking that for a regression is worth recording, because the first attempt lied.** An
+immediate re-run of the batch-16 arm gave 47.33 tok/s against the 72.84 published in Phase 3
+— an apparent 35% regression. But its IQR was 43.82–62.58 versus 72.05–73.09 originally, and
+that spread is the tell: the machine had been benchmarking and compiling continuously for
+hours and was thermally loaded. Re-measured after letting it settle, the same code gives
+**80.05 tok/s (IQR 77.41–88.27)** — *higher* than the original figure. No regression is
+detectable, and the Phase 3 result stands.
+
+The lesson is the one this document's methodology section already argues for: a single number
+from a hot machine is not a measurement, and a wide IQR is the signal that says so. Had the
+variance not been reported alongside the median, the honest-looking move would have been to
+publish a 35% regression that does not exist.
+
+### Prefix caching before retention (historical)
 
 Sharing is implemented end to end — hashed block-aligned prefixes, refcounted blocks,
 mirrored into the backend with `llama_memory_seq_cp` so the saving is real work avoided

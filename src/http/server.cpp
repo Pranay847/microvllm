@@ -37,6 +37,7 @@ bool serve(IModelEngine& engine, const ServerConfig& config) {
                                            .mode           = config.mode,
                                            .kv_blocks      = config.kv_blocks,
                                            .block_size     = config.block_size,
+                                           .prefix_donors  = config.prefix_donors,
                                            .prefix_caching = config.prefix_caching,
                                            .prefill_chunk  = config.prefill_chunk});
     std::thread  worker_thread([&] { scheduler.run(); });
@@ -93,6 +94,12 @@ bool serve(IModelEngine& engine, const ServerConfig& config) {
                 s.prefix_hits);
         counter("prefix_tokens_saved_total", "Prompt tokens not prefilled thanks to sharing.",
                 s.prefix_tokens_saved);
+
+        counter("prefix_donors_retained_total",
+                "Prompt prefixes kept past their request's retirement.", s.donors_retained);
+        counter("prefix_donor_evictions_total",
+                "Retained prefixes dropped, by LRU or block pressure.", s.donor_evictions);
+        gauge("prefix_donors_held", "Donor slots currently holding a prefix.", s.donors_held);
 
         counter("prompt_tokens_total", "Input tokens served.", s.prompt_tokens);
         counter("completion_tokens_total", "Output tokens generated.", s.completion_tokens);

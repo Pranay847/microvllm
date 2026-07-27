@@ -84,6 +84,24 @@ struct LlamaModelEngine::Impl {
         cp.n_seq_max       = cfg.n_seq_max;
         cp.n_threads       = cfg.n_threads;
         cp.n_threads_batch = cfg.n_threads;
+
+        // Required for prefix sharing, not merely preferred.
+        //
+        // llama_memory_seq_cp has two implementations. The unified one adds the
+        // destination sequence to the cells in [p0, p1), which is exactly a partial
+        // prefix copy. The per-stream one copies whole buffers and asserts:
+        //
+        //   GGML_ASSERT(is_full && "seq_cp() is only supported for full KV buffers")
+        //
+        // aborting the process. Sharing a *prefix* is by definition a partial copy, so
+        // without this the first genuine cache hit kills the server.
+        //
+        // The documented cost is some efficiency when sequences do NOT share a large
+        // prefix, so this follows whether sharing is enabled rather than being forced on:
+        // --no-prefix-cache gets the faster per-stream cache, and anything that can
+        // actually perform a partial copy gets the unified one.
+        cp.kv_unified = cfg.kv_unified;
+
         context.reset(llama_init_from_model(model.get(), cp));
         if (!context) {
             throw std::runtime_error("failed to create llama_context");

@@ -39,6 +39,12 @@ struct LlamaEngineConfig {
     std::uint32_t n_seq_max    = 16;
     std::int32_t  n_threads    = 8;     // the operating point chosen in Phase 0
     std::int32_t  n_gpu_layers = 0;     // CPU-only on this hardware
+
+    // Required for prefix sharing: llama_memory_seq_cp supports a partial range only on a
+    // unified cache, and sharing a prefix is by definition a partial copy. The per-stream
+    // path asserts and aborts instead. Unified costs some efficiency when sequences do not
+    // share a large prefix, so it is enabled only when sharing is actually in use.
+    bool kv_unified = true;
 };
 
 // IModelEngine backed by llama.cpp. Owns one model + one context; a single engine

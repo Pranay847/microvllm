@@ -55,7 +55,11 @@ public:
 private:
     struct SeqState {
         std::size_t        gen_index = 0;  // how many response bytes emitted so far
-        std::vector<Token> echo;           // captured prompt (echo mode only)
+        // Prompt tokens submitted to this sequence, VERBATIM -- BOS included. Modelling
+        // KV cells, so index i here is KV position i. Keeping BOS is what makes
+        // copy_sequence's token count line up with the scheduler's, which counts
+        // positions; stripping it here would put the copy off by one.
+        std::vector<Token> prefilled;
     };
 
     Config                              config_;

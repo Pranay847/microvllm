@@ -79,8 +79,18 @@ std::uint64_t PrefixCache::hash_prefix(std::span<const Token> tokens, std::uint3
     return h;
 }
 
+void PrefixCache::configure_donors(SeqId first, std::uint32_t count) {
+    first_donor_slot_ = first;
+    donor_capacity_   = count;
+    free_donor_slots_.clear();
+    free_donor_slots_.reserve(count);
+    for (std::uint32_t i = count; i > 0; --i) {
+        free_donor_slots_.push_back(first + static_cast<SeqId>(i - 1));
+    }
+}
+
 std::optional<PrefixCache::Entry> PrefixCache::find_longest(std::span<const Token> tokens,
-                                                            std::uint32_t block_size) const {
+                                                            std::uint32_t block_size) {
     if (block_size == 0 || tokens.empty()) {
         return std::nullopt;
     }
@@ -90,21 +100,76 @@ std::optional<PrefixCache::Entry> PrefixCache::find_longest(std::span<const Toke
     for (std::uint32_t nb = max_blocks; nb > 0; --nb) {
         const std::uint32_t n_tokens = nb * block_size;
         const auto          it       = entries_.find(hash_prefix(tokens, n_tokens));
-        if (it != entries_.end() && it->second.n_tokens == n_tokens) {
-            return it->second;
+        if (it != entries_.end() && it->second.entry.n_tokens == n_tokens) {
+            // Touch on read: a prefix that keeps being hit must not be the one evicted
+            // when the donor pool fills up.
+            it->second.last_used = ++tick_;
+            return it->second.entry;
         }
     }
     return std::nullopt;
 }
 
 void PrefixCache::insert(std::uint64_t hash, Entry entry) {
-    entries_[hash] = std::move(entry);
+    entries_[hash] = Record{std::move(entry), ++tick_};
+}
+
+std::optional<SeqId> PrefixCache::take_donor_slot() {
+    if (free_donor_slots_.empty()) {
+        return std::nullopt;
+    }
+    const SeqId slot = free_donor_slots_.back();
+    free_donor_slots_.pop_back();
+    return slot;
+}
+
+void PrefixCache::retain(std::uint64_t hash, SeqId slot, std::uint32_t n_tokens,
+                         std::vector<BlockId> blocks) {
+    Entry e;
+    e.seq      = slot;
+    e.n_tokens = n_tokens;
+    e.blocks   = std::move(blocks);
+    e.retained = true;
+    entries_[hash] = Record{std::move(e), ++tick_};
+}
+
+std::optional<PrefixCache::Entry> PrefixCache::evict_lru_retained() {
+    auto victim = entries_.end();
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+        if (!it->second.entry.retained) {
+            continue;  // a live sequence's entry is not ours to reclaim
+        }
+        if (victim == entries_.end() || it->second.last_used < victim->second.last_used) {
+            victim = it;
+        }
+    }
+    if (victim == entries_.end()) {
+        return std::nullopt;
+    }
+    Entry out = std::move(victim->second.entry);
+    entries_.erase(victim);
+    free_donor_slots_.push_back(out.seq);
+    return out;
 }
 
 void PrefixCache::evict_sequence(SeqId seq) {
     for (auto it = entries_.begin(); it != entries_.end();) {
-        it = it->second.seq == seq ? entries_.erase(it) : std::next(it);
+        if (it->second.entry.seq != seq) {
+            it = std::next(it);
+            continue;
+        }
+        // If this was a donor, its slot becomes reusable. Guarded on `retained` so a live
+        // sequence's id can never be mistaken for a donor slot and released into the pool.
+        if (it->second.entry.retained) {
+            free_donor_slots_.push_back(seq);
+        }
+        it = entries_.erase(it);
     }
+}
+
+void PrefixCache::clear() {
+    entries_.clear();
+    configure_donors(first_donor_slot_, donor_capacity_);
 }
 
 // ---------------------------------------------------------------------------

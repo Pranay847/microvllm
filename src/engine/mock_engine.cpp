@@ -69,7 +69,7 @@ std::vector<GenStep> MockModelEngine::decode(std::span<const BatchItem> batch) {
             tokens_prefilled_ += item.tokens.size();  // work a shared prefix would avoid
         }
 
-        // Echo mode: accumulate the prompt (minus BOS) as this sequence's response.
+        // Echo mode: record the prompt tokens this sequence has been given.
         //
         // This runs for EVERY item, before the sampling check, because that is what a
         // real engine does: all tokens in the batch are processed and populate the KV
@@ -77,20 +77,32 @@ std::vector<GenStep> MockModelEngine::decode(std::span<const BatchItem> batch) {
         // items would miss every intermediate chunk of a chunked prefill.
         if (config_.echo_prompt && state.gen_index == 0) {
             for (const Token t : item.tokens) {
-                if (t != kBosToken) {
-                    state.echo.push_back(t);
-                }
+                state.prefilled.push_back(t);
             }
         }
 
         if (!item.sample) {
             continue;  // KV populated, but no token produced for this item
         }
-        const std::vector<Token>& response = config_.echo_prompt ? state.echo : response_tokens_;
 
-        if (state.gen_index < response.size()) {
+        // The echoed response is the prompt with control tokens dropped. Derived here
+        // rather than stored that way, so `prefilled` stays a faithful position-indexed
+        // model of the KV cache -- which is what makes copy_sequence exact.
+        std::vector<Token>        echo;
+        const std::vector<Token>* response = &response_tokens_;
+        if (config_.echo_prompt) {
+            echo.reserve(state.prefilled.size());
+            for (const Token t : state.prefilled) {
+                if (t != kBosToken) {
+                    echo.push_back(t);
+                }
+            }
+            response = &echo;
+        }
+
+        if (state.gen_index < response->size()) {
             steps.push_back(
-                GenStep{.seq = item.seq, .token = response[state.gen_index], .is_eog = false});
+                GenStep{.seq = item.seq, .token = (*response)[state.gen_index], .is_eog = false});
             ++state.gen_index;
         } else {
             steps.push_back(GenStep{.seq = item.seq, .token = kEosToken, .is_eog = true});
@@ -115,9 +127,12 @@ void MockModelEngine::copy_sequence(SeqId src, SeqId dst, Pos n_tokens) {
     // Model the real effect: `dst` inherits the prefix without prefilling it. In echo
     // mode that means adopting the copied prompt tokens, exactly as a real backend
     // inherits their KV cells.
-    const auto take = std::min(static_cast<std::size_t>(n_tokens), s->second.echo.size());
-    d->second.echo.assign(s->second.echo.begin(), s->second.echo.begin() +
-                                                      static_cast<std::ptrdiff_t>(take));
+    // n_tokens counts KV positions, and `prefilled` is indexed by position, so this is a
+    // straight prefix copy with no adjustment -- which is the point of storing BOS.
+    const auto take = std::min(static_cast<std::size_t>(n_tokens), s->second.prefilled.size());
+    d->second.prefilled.assign(
+        s->second.prefilled.begin(),
+        s->second.prefilled.begin() + static_cast<std::ptrdiff_t>(take));
     tokens_copied_ += take;
 }
 

@@ -168,13 +168,29 @@ strand work the server had already accepted.
 hardware cannot exhaust the cache by accident. `--kv-blocks` exists so admission control,
 preemption, and eviction are observable and benchmarkable by design.
 
-**Prefix sharing, and its current limit.** Block-aligned prompt prefixes are hashed; a hit
-increfs the donor's blocks and mirrors the KV with `llama_memory_seq_cp`, so the new sequence
-prefills only its divergent suffix — real work avoided, not bookkeeping. But an entry names a
-*live* donor: when the donor retires its KV is reclaimed and the entry goes with it, so
-sharing only helps sequences that overlap in time. Sequential reuse, the case prefix caching
-is usually pitched on, gets nothing today. Retaining donors past retirement (an LRU of pinned
-donor slots, evicted on demand) is the next step and is not claimed as done.
+**Prefix sharing.** Block-aligned prompt prefixes are hashed; a hit increfs the donor's
+blocks and mirrors the KV with `llama_memory_seq_cp`, so the new sequence prefills only its
+divergent suffix — real work avoided, not bookkeeping.
+
+**Donor retention.** A prefix would otherwise die with the request that produced it, limiting
+sharing to sequences that overlap in time. Instead a retiring sequence's prefix is copied into
+a reserved *donor slot* (ids allocated above the batch slots) and kept, so later,
+non-overlapping requests still hit. Donors cost real resources — a sequence id and pinned
+blocks — so they are bounded by `--prefix-donors`, evicted least-recently-used, and
+**reclaimed before any live sequence is preempted**: a donor is cache whose loss costs a
+recompute later, while a live sequence is work already done.
+
+Two constraints here are easy to get wrong, and both fail silently or violently rather than
+obviously:
+
+- **The donor slot must be registered with the engine before copying into it.** A sequence
+  exists only once the engine knows about it, so copying into an unregistered slot silently
+  does nothing — and the next hit then inherits an empty prefix and produces *wrong output*
+  rather than merely missing.
+- **The context must be created with `kv_unified = true`.** `llama_memory_seq_cp` supports a
+  partial range only on a unified cache; the per-stream path asserts `is_full` and aborts the
+  process. Sharing a prefix is by definition a partial copy, so the non-unified default turns
+  the first genuine cache hit into a crash.
 
 ## Benchmark methodology
 

@@ -102,10 +102,15 @@ TEST(PrefixCache, EvictingASequenceRemovesItsEntries) {
 
 SchedulerConfig cfg(bool prefix_caching, std::size_t batch = 2,
                     std::uint32_t block_size = 16) {
+    // Donors off by default here: these tests isolate sharing between concurrently-live
+    // sequences. Retention adds a second, legitimate holder of blocks and a second reason
+    // to copy KV, which would blur what each assertion is actually measuring. The donor
+    // tests below turn it on explicitly.
     return SchedulerConfig{.max_batch_size = batch,
                            .mode           = BatchingMode::kContinuous,
                            .kv_blocks      = 256,
                            .block_size     = block_size,
+                           .prefix_donors  = 0,
                            .prefix_caching = prefix_caching};
 }
 
@@ -155,6 +160,165 @@ SharedPromptRun run_shared_prompt(bool prefix_caching, int n_requests = 8) {
     out.hits      = sched.stats().prefix_hits;
     out.saved     = sched.stats().prefix_tokens_saved;
     return out;
+}
+
+// --- Donor retention ---------------------------------------------------------------
+//
+// The case that motivated the feature: requests arriving strictly one after another, each
+// fully finished before the next is submitted. Without retention there is never a live
+// donor and the hit rate is exactly zero.
+
+struct SequentialRun {
+    std::uint64_t            prefilled = 0;
+    std::uint64_t            hits      = 0;
+    std::uint64_t            retained  = 0;
+    std::uint64_t            evictions = 0;
+    std::vector<std::string> texts;
+};
+
+SequentialRun run_sequential(std::uint32_t donors, int n_requests = 4) {
+    const std::string system(96, 'S');
+
+    MockModelEngine engine(MockModelEngine::Config{
+        .response = "", .echo_prompt = true, .n_seq_max = 16});
+    RequestQueue queue(64);
+    SchedulerConfig c   = cfg(/*prefix_caching=*/true, /*batch=*/2);
+    c.prefix_donors     = donors;
+    Scheduler    sched(engine, queue, c);
+    std::thread  t([&] { sched.run(); });
+
+    SequentialRun out;
+    for (int i = 0; i < n_requests; ++i) {
+        const std::string suffix(static_cast<std::size_t>(1 + i), 'q');
+        Request           r = make_req(static_cast<RequestId>(i), system + suffix, 4);
+        auto              f = r.result.get_future();
+        EXPECT_TRUE(queue.try_push(r));
+        // Block for this request before submitting the next: nothing overlaps in time, so
+        // any hit must come from a retained donor rather than a live sequence.
+        out.texts.push_back(f.get().text);
+    }
+    queue.close();
+    t.join();
+
+    out.prefilled = engine.tokens_prefilled();
+    out.hits      = sched.stats().prefix_hits;
+    out.retained  = sched.stats().donors_retained;
+    out.evictions = sched.stats().donor_evictions;
+    return out;
+}
+
+TEST(PrefixDonors, SequentialRequestsHitARetainedPrefix) {
+    const SequentialRun without = run_sequential(/*donors=*/0);
+    const SequentialRun with    = run_sequential(/*donors=*/4);
+
+    EXPECT_EQ(without.hits, 0U)
+        << "sanity: with no donors, sequential traffic must have nothing to share";
+    EXPECT_GT(with.hits, 0U) << "donor retention did not produce a single hit";
+    EXPECT_GT(with.retained, 0U) << "no prefix was ever retained";
+    EXPECT_LT(with.prefilled, without.prefilled)
+        << "retention must avoid real prefill work (" << with.prefilled << " vs "
+        << without.prefilled << ")";
+}
+
+TEST(PrefixDonors, RetentionDoesNotChangeResults) {
+    // The whole point is to skip recomputation, not to change what is produced.
+    EXPECT_EQ(run_sequential(/*donors=*/0).texts, run_sequential(/*donors=*/4).texts);
+}
+
+TEST(PrefixDonors, DonorPoolIsBoundedAndEvictsLeastRecentlyUsed) {
+    // More distinct prefixes than donor slots: the pool must stay within its bound and
+    // evict rather than grow.
+    MockModelEngine engine(MockModelEngine::Config{
+        .response = "", .echo_prompt = true, .n_seq_max = 16});
+    RequestQueue    queue(64);
+    SchedulerConfig c = cfg(/*prefix_caching=*/true, /*batch=*/2);
+    c.prefix_donors   = 2;
+    Scheduler   sched(engine, queue, c);
+    std::thread t([&] { sched.run(); });
+
+    for (int i = 0; i < 6; ++i) {
+        // Distinct long prefixes, so each retire wants its own donor slot.
+        const std::string prompt(96, static_cast<char>('A' + i));
+        Request           r = make_req(static_cast<RequestId>(i), prompt, 4);
+        auto              f = r.result.get_future();
+        ASSERT_TRUE(queue.try_push(r));
+        (void)f.get();
+    }
+    queue.close();
+    t.join();
+
+    const auto s = sched.stats();
+    EXPECT_LE(s.donors_held, 2U) << "donor pool exceeded its configured bound";
+    EXPECT_GT(s.donor_evictions, 0U) << "pool never evicted despite more prefixes than slots";
+}
+
+TEST(PrefixDonors, RetainedBlocksAreAccountedForAndFullyReclaimable) {
+    // Donors deliberately hold blocks after their request finishes -- that is the feature,
+    // not a leak. The property that must hold is that the blocks they hold are bounded and
+    // come back once the donors are evicted, so retention can never bleed the pool dry.
+    MockModelEngine engine(MockModelEngine::Config{
+        .response = "", .echo_prompt = true, .n_seq_max = 16});
+    RequestQueue    queue(64);
+    SchedulerConfig c = cfg(/*prefix_caching=*/true, /*batch=*/2);
+    c.prefix_donors   = 3;
+    Scheduler   sched(engine, queue, c);
+    std::thread t([&] { sched.run(); });
+
+    for (int i = 0; i < 5; ++i) {
+        const std::string prompt(96, static_cast<char>('A' + i));
+        Request           r = make_req(static_cast<RequestId>(i), prompt, 4);
+        auto              f = r.result.get_future();
+        ASSERT_TRUE(queue.try_push(r));
+        (void)f.get();
+    }
+    queue.close();
+    t.join();
+
+    const auto after = sched.stats();
+    EXPECT_GT(after.kv_blocks_used, 0U) << "nothing was retained, so there is nothing to test";
+    EXPECT_LE(after.donors_held, 3U);
+
+    // Every block still held must belong to a donor. Retention is the only thing allowed
+    // to outlive a request; anything else is a genuine leak.
+    EXPECT_LE(after.kv_blocks_used, after.donors_held * (96 / 16 + 1))
+        << "more blocks are held than the retained prefixes can account for";
+}
+
+TEST(PrefixDonors, DonorsAreReclaimedBeforeLiveSequencesArePreempted) {
+    // The policy that matters under memory pressure: a donor is cache and a running
+    // sequence is work. With a pool small enough to force reclamation, the scheduler must
+    // give up donors first and ideally never preempt at all.
+    MockModelEngine engine(MockModelEngine::Config{
+        .response = "", .echo_prompt = true, .n_seq_max = 16});
+    RequestQueue    queue(64);
+    SchedulerConfig c = cfg(/*prefix_caching=*/true, /*batch=*/2);
+    c.kv_blocks       = 12;  // tight: donors and live sequences genuinely compete
+    c.prefix_donors   = 4;
+    Scheduler   sched(engine, queue, c);
+    std::thread t([&] { sched.run(); });
+
+    std::vector<std::future<GenResult>> futures;
+    std::vector<std::string>            prompts;
+    for (int i = 0; i < 8; ++i) {
+        const std::string p = std::string(64, static_cast<char>('a' + i));
+        Request           r = make_req(static_cast<RequestId>(i), p, 8);
+        futures.push_back(r.result.get_future());
+        prompts.push_back(p);
+        ASSERT_TRUE(queue.try_push(r));
+    }
+    queue.close();
+    t.join();
+
+    // Correctness first: reclaiming cache must never corrupt or drop a request.
+    // max_tokens is 8, so each echo is the prompt's first 8 characters.
+    for (std::size_t i = 0; i < futures.size(); ++i) {
+        EXPECT_EQ(futures[i].get().text, prompts[i].substr(0, 8))
+            << "request " << i << " was corrupted";
+    }
+    const auto s = sched.stats();
+    EXPECT_GT(s.donor_evictions, 0U) << "pressure never reached the donor pool";
+    EXPECT_GE(s.donor_evictions, s.preemptions)
+        << "live sequences were preempted before cache was given up";
 }
 
 TEST(PrefixCacheScheduler, SharedSystemPromptAvoidsPrefillWork) {

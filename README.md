@@ -116,12 +116,12 @@ tested as properties over long alloc/free sequences), and the behaviour it produ
 admission control, LIFO preemption, prefix sharing — is real and measurable. But it is a
 governor over someone else's memory, not a replacement for it.
 
-**Prefix sharing has a limit that is not papered over:** an entry names a *live* donor
-sequence, so it only helps requests that overlap in time. A sequential run of eight requests
-behind the same system prompt records **zero hits**, because each donor retires before the
-next arrives — and sequential reuse is the case prefix caching is usually pitched on.
-Retaining donors past retirement (an LRU of pinned slots) is the natural next step and is not
-claimed as done.
+**Prefix sharing survives its donor.** When a sequence retires holding a block-aligned
+prompt prefix, its KV is copied into a reserved donor slot and kept, so a request arriving
+long afterwards still hits. On six requests behind a shared system prompt sent strictly one
+after another — nothing overlapping — retention takes the run from **0 hits / 9.9 s** to
+**4 hits / 4.4 s**, a 2.25× speedup. Donors are bounded, evicted LRU, and reclaimed *before*
+any live sequence is preempted: cache yields to work in progress.
 
 ---
 
@@ -154,7 +154,8 @@ curl -N -X POST localhost:8080/generate/stream -d '{"prompt":"Count to five:","m
 | `--scheduler continuous\|static` | scheduling policy (the benchmark's two arms) |
 | `--prefill-chunk <n>` | prompt tokens per sequence per step |
 | `--kv-blocks <n>` / `--block-size <n>` | KV budget — lower it to exercise preemption |
-| `--no-prefix-cache` | disable prefix sharing |
+| `--no-prefix-cache` | disable prefix sharing (also selects the faster per-stream KV cache) |
+| `--prefix-donors <n>` | prefixes retained past their request's exit (default 4, 0 = off) |
 | `--log-requests` | one structured JSON line per request |
 | `--mock-echo` | serve without a model, for load testing |
 
@@ -210,6 +211,11 @@ worth reading. Three were only findable with a real model, and three presented a
   progressing. Admission reserved only the prompt's blocks, leaving no room to *grow*. Fixed
   with an admission watermark. Found by instrumenting the loop after reasoning from the code
   produced a plausible-but-wrong answer twice.
+- **Prefix sharing would abort the server on its first real cache hit.** `llama_memory_seq_cp`
+  supports partial copies only on a *unified* KV cache, and the context was using llama.cpp's
+  non-unified default. It shipped undetected because the sequential test recorded zero hits,
+  so the backend call was never once exercised — the feature "worked" only in the sense that
+  nothing had tried it.
 
 ---
 
