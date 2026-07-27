@@ -35,6 +35,7 @@ struct Args {
     std::uint32_t block_size   = 16;
     bool          no_prefix_cache = false;
     bool          log_requests    = false;
+    std::uint32_t prefix_donors   = 4;
     microvllm::BatchingMode mode = microvllm::BatchingMode::kContinuous;
 };
 
@@ -126,6 +127,9 @@ Args parse_args(int argc, char** argv) {
             a.no_prefix_cache = true;
         } else if (std::strcmp(arg, "--log-requests") == 0) {
             a.log_requests = true;
+        } else if (std::strcmp(arg, "--prefix-donors") == 0) {
+            a.prefix_donors =
+                static_cast<std::uint32_t>(std::atoi(need_value(argc, argv, i, argv[0])));
         } else if (std::strcmp(arg, "--quiet") == 0) {
             a.quiet = true;
         } else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
@@ -155,7 +159,8 @@ int main(int argc, char** argv) {
                                              .kv_blocks       = args.kv_blocks,
                                              .block_size      = args.block_size,
                                              .prefix_caching  = !args.no_prefix_cache,
-                                             .log_requests    = args.log_requests};
+                                             .log_requests    = args.log_requests,
+                                             .prefix_donors   = args.prefix_donors};
 
     if (args.has_mock) {
         std::printf("microvllm %s (mock engine%s)\n", microvllm::kVersion,
@@ -186,6 +191,8 @@ int main(int argc, char** argv) {
         // mean -- the context available to one request -- so scale it up here. Without
         // this, raising --batch-size silently shrinks every request's usable context.
         cfg.n_ctx      = args.n_ctx * cfg.n_seq_max;
+        // Only pay for the unified KV cache when prefix sharing might actually use it.
+        cfg.kv_unified = !args.no_prefix_cache;
         microvllm::LlamaModelEngine engine(cfg);
         return microvllm::serve(engine, server_cfg) ? 0 : 1;
     } catch (const std::exception& e) {

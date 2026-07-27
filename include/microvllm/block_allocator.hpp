@@ -84,22 +84,40 @@ private:
 // Keyed on a rolling hash of the token prefix, granular to whole blocks: a partial block
 // cannot be shared, since the sequence must be free to write the rest of it.
 //
-// SCOPE, STATED PLAINLY: an entry names a *live* sequence, so sharing only happens between
-// sequences that overlap in time. When the donor retires its KV is reclaimed and the entry
-// is evicted, so a request arriving after every previous one has finished gets no benefit.
-// That covers concurrent traffic behind a shared system prompt, but not the sequential
-// case, which is where prefix caching is most often pitched.
+// DONOR RETENTION: an entry normally names a *live* sequence, which limits sharing to
+// requests that overlap in time -- useless for sequential traffic, which is the case prefix
+// caching is most often pitched on. So when a sequence retires holding a cacheable prefix,
+// its KV is copied into a reserved "donor" slot and kept, letting a request that arrives
+// long afterwards still hit.
 //
-// Retaining a donor past retirement would mean pinning its llama.cpp sequence and blocks
-// (an LRU of "donor" slots that are evicted on demand). That is the natural next step and
-// is deliberately not claimed here.
+// Retention is not free: a donor pins a llama.cpp sequence id and holds real blocks that
+// active requests could otherwise use. Two rules follow, and both matter:
+//
+//   * Donors are bounded (--prefix-donors) and evicted least-recently-used, so the cache
+//     cannot grow without limit.
+//   * Donors are reclaimed BEFORE live sequences are preempted. A donor is pure cache and
+//     losing it costs a recompute later; a live sequence is work already in progress and
+//     killing it throws that work away. Cache should always yield to work.
 class PrefixCache {
 public:
     struct Entry {
         SeqId                seq;       // sequence whose KV holds this prefix
         std::uint32_t        n_tokens;  // tokens covered
         std::vector<BlockId> blocks;
+        // True once the originating request has retired and this entry has been moved to a
+        // reserved donor slot. Retained entries are the ones eligible for LRU eviction.
+        bool                 retained = false;
     };
+
+    // Reserve `count` sequence ids starting at `first` for retained prefixes. These live
+    // above the scheduler's batch slots, so the engine must be built with
+    // n_seq_max >= max_batch_size + count.
+    void configure_donors(SeqId first, std::uint32_t count);
+
+    [[nodiscard]] std::uint32_t donor_capacity() const { return donor_capacity_; }
+    [[nodiscard]] std::uint32_t donors_held() const {
+        return donor_capacity_ - static_cast<std::uint32_t>(free_donor_slots_.size());
+    }
 
     // Hash the first `n_tokens` of `tokens`. Whole-block granularity, so the returned
     // hash covers exactly floor(n_tokens / block_size) * block_size tokens.
@@ -107,21 +125,46 @@ public:
                                                    std::uint32_t          n_tokens);
 
     // Longest cached prefix of `tokens`, or nullopt. Checks progressively shorter
-    // block-aligned prefixes so a partial match still helps.
+    // block-aligned prefixes so a partial match still helps. Marks the hit as recently
+    // used, which is what keeps a hot prefix from being evicted under churn.
     [[nodiscard]] std::optional<Entry> find_longest(std::span<const Token> tokens,
-                                                    std::uint32_t block_size) const;
+                                                    std::uint32_t block_size);
 
     void insert(std::uint64_t hash, Entry entry);
 
-    // Drop every entry owned by `seq`. Called when that sequence's cache goes away, since
-    // the entry names a live sequence whose KV is about to stop existing.
+    // Take a free donor slot, or nullopt if all are occupied. The caller is responsible
+    // for copying KV into it and calling retain().
+    [[nodiscard]] std::optional<SeqId> take_donor_slot();
+
+    // Record that `slot` now holds this prefix past its originating request's retirement.
+    void retain(std::uint64_t hash, SeqId slot, std::uint32_t n_tokens,
+                std::vector<BlockId> blocks);
+
+    // Evict the least-recently-used retained entry and hand it back so the caller can free
+    // its blocks and release its engine sequence. Returns nullopt if no donors are held.
+    [[nodiscard]] std::optional<Entry> evict_lru_retained();
+
+    // Drop every entry owned by `seq`, returning a donor slot to the free list if `seq` was
+    // one. Called when that sequence's KV is about to stop existing.
     void evict_sequence(SeqId seq);
 
     [[nodiscard]] std::size_t size() const { return entries_.size(); }
-    void clear() { entries_.clear(); }
+    void clear();
 
 private:
-    std::unordered_map<std::uint64_t, Entry> entries_;
+    struct Record {
+        Entry         entry;
+        std::uint64_t last_used = 0;  // monotonic tick; smallest is the LRU victim
+    };
+
+    // A plain counter and a linear scan rather than an intrusive LRU list: donor counts are
+    // single digits, so the scan is trivial and the simpler structure has fewer ways to
+    // corrupt itself.
+    std::unordered_map<std::uint64_t, Record> entries_;
+    std::vector<SeqId>                        free_donor_slots_;
+    SeqId                                     first_donor_slot_ = 0;
+    std::uint32_t                             donor_capacity_   = 0;
+    std::uint64_t                             tick_             = 0;
 };
 
 // One sequence's page table: the blocks backing its KV cache, in logical order.

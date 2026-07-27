@@ -29,10 +29,14 @@ Request make_req(RequestId id, std::string prompt, std::uint32_t max_tokens = 51
 
 SchedulerConfig kv_config(std::uint32_t blocks, std::uint32_t block_size = 16,
                           std::size_t batch = 4) {
+    // Donors off: these tests are about admission control and preemption under a fixed
+    // budget, and a retained prefix is a legitimate holder of blocks that would otherwise
+    // show up as an apparent leak. Donor block accounting has its own test.
     return SchedulerConfig{.max_batch_size = batch,
                            .mode           = BatchingMode::kContinuous,
                            .kv_blocks      = blocks,
                            .block_size     = block_size,
+                           .prefix_donors  = 0,
                            .prefill_chunk  = 128};
 }
 

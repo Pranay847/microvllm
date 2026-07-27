@@ -32,6 +32,13 @@ struct SchedulerConfig {
     std::uint32_t kv_blocks  = 0;
     std::uint32_t block_size = 16;  // tokens per block, matching vLLM's default
 
+    // Reserved sequence slots holding prefixes past their request's retirement, so
+    // sequential traffic behind a shared prompt can hit. Each costs one llama.cpp sequence
+    // id and pins real blocks, so they are bounded and reclaimed LRU -- and reclaimed
+    // before any live sequence is preempted, since cache should yield to work in progress.
+    // 0 disables retention, leaving sharing to sequences that overlap in time.
+    std::uint32_t prefix_donors = 4;
+
     // Share KV cache between requests with a common prompt prefix. Chat traffic is highly
     // redundant -- the same system prompt or conversation history leads every request --
     // and prefill is the compute-bound half of inference, so recomputing it is pure waste.
@@ -90,6 +97,9 @@ public:
         std::uint64_t deferred    = 0;  // admissions delayed because the pool was full
         std::uint64_t prefix_hits = 0;  // requests that inherited a cached prompt prefix
         std::uint64_t prefix_tokens_saved = 0;  // prompt tokens not prefilled thanks to hits
+        std::uint64_t donors_retained  = 0;     // prefixes kept past their request's exit
+        std::uint64_t donor_evictions  = 0;     // donors dropped, by LRU or block pressure
+        std::uint32_t donors_held      = 0;     // donor slots currently occupied
         std::uint64_t prompt_tokens     = 0;    // billable input tokens served
         std::uint64_t completion_tokens = 0;    // billable output tokens served
         std::uint32_t kv_blocks_total = 0;
@@ -114,6 +124,14 @@ private:
 
     void run_static();
     void run_continuous();
+
+    // Copy a retiring sequence's prompt prefix into a donor slot so it outlives the
+    // request. No-op when donors are disabled or the prefix is shorter than a block.
+    void retain_prefix(Job& job);
+    // Free everything an evicted donor held (blocks + engine sequence).
+    void release_donor(const PrefixCache::Entry& donor);
+    // Drop the least-recently-used donor to free blocks. True if anything was reclaimed.
+    [[nodiscard]] bool reclaim_donor_blocks();
 
     // Evict the most-recently-admitted sequence to free cache blocks, requeueing it for
     // recompute. LIFO on purpose: the newest sequence has the least work invested, so
@@ -151,6 +169,9 @@ private:
         std::atomic<std::uint64_t> deferred{0};
         std::atomic<std::uint64_t> prefix_hits{0};
         std::atomic<std::uint64_t> prefix_tokens_saved{0};
+        std::atomic<std::uint64_t> donors_retained{0};
+        std::atomic<std::uint64_t> donor_evictions{0};
+        std::atomic<std::uint32_t> donors_held{0};
         std::atomic<std::uint64_t> prompt_tokens{0};
         std::atomic<std::uint64_t> completion_tokens{0};
         std::atomic<std::uint32_t> kv_blocks_total{0};

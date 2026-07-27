@@ -112,6 +112,25 @@ Scheduler::Scheduler(IModelEngine& engine, RequestQueue& queue, SchedulerConfig 
     blocks_            = std::make_unique<BlockAllocator>(pool, block_size);
     stats_.kv_blocks_total.store(pool, std::memory_order_relaxed);
 
+    // Donor slots live above the batch slots, so ids never collide with a live sequence.
+    // Clamp to what the engine can actually address: asking llama.cpp for a sequence id
+    // beyond n_seq_max aborts the process.
+    std::uint32_t donors = config_.prefix_caching ? config_.prefix_donors : 0;
+    if (donors > 0) {
+        const auto n_seq = static_cast<std::uint32_t>(engine_.caps().n_seq_max);
+        const auto batch = static_cast<std::uint32_t>(config_.max_batch_size);
+        const std::uint32_t room = n_seq > batch ? n_seq - batch : 0;
+        if (donors > room) {
+            std::fprintf(stderr,
+                         "microvllm: %u prefix donors exceeds the engine's spare sequence "
+                         "capacity (%u); clamping\n",
+                         donors, room);
+            donors = room;
+        }
+    }
+    config_.prefix_donors = donors;
+    prefix_cache_.configure_donors(static_cast<SeqId>(config_.max_batch_size), donors);
+
     if (config_.max_batch_size == 0) {
         config_.max_batch_size = 1;
     }
@@ -164,6 +183,9 @@ Scheduler::Stats Scheduler::stats() const {
     s.deferred            = stats_.deferred.load(std::memory_order_relaxed);
     s.prefix_hits         = stats_.prefix_hits.load(std::memory_order_relaxed);
     s.prefix_tokens_saved = stats_.prefix_tokens_saved.load(std::memory_order_relaxed);
+    s.donors_retained     = stats_.donors_retained.load(std::memory_order_relaxed);
+    s.donor_evictions     = stats_.donor_evictions.load(std::memory_order_relaxed);
+    s.donors_held         = stats_.donors_held.load(std::memory_order_relaxed);
     s.prompt_tokens       = stats_.prompt_tokens.load(std::memory_order_relaxed);
     s.completion_tokens   = stats_.completion_tokens.load(std::memory_order_relaxed);
     s.kv_blocks_total     = stats_.kv_blocks_total.load(std::memory_order_relaxed);
@@ -177,12 +199,105 @@ void Scheduler::retire(Job& job) {
     // go before the sequence does -- otherwise a later hit would copy from a slot that has
     // been recycled by an unrelated request.
     prefix_cache_.evict_sequence(job.state->seq());
+
+    // Before the KV disappears, try to keep this prompt's prefix in a donor slot. This is
+    // what lets a request arriving after every previous one has finished still hit.
+    retain_prefix(job);
+
     if (job.blocks) {
         job.blocks->release();  // return this sequence's cache to the pool
     }
     engine_.release_sequence(job.state->seq());
     stats_.completed.fetch_add(1, std::memory_order_relaxed);
     deliver(job);
+}
+
+// Copy a retiring sequence's block-aligned prompt prefix into a reserved donor slot so it
+// outlives the request that produced it.
+//
+// The copy has to happen here, while the source sequence still exists: once
+// release_sequence runs, its KV is gone and there is nothing left to preserve.
+void Scheduler::retain_prefix(Job& job) {
+    if (!config_.prefix_caching || prefix_cache_.donor_capacity() == 0 || !job.blocks) {
+        return;
+    }
+
+    // Only whole blocks are shareable, and only the prompt: generated tokens differ per
+    // request, so caching them would be a hit that is never reused.
+    const std::span<const Token> prompt   = job.state->prompt();
+    const std::uint32_t          n_tokens =
+        (static_cast<std::uint32_t>(prompt.size()) / config_.block_size) * config_.block_size;
+    if (n_tokens == 0) {
+        return;
+    }
+
+    const std::uint32_t n_blocks = n_tokens / config_.block_size;
+    if (n_blocks > job.blocks->n_blocks()) {
+        return;  // sequence never grew far enough to back the whole prefix
+    }
+
+    const std::uint64_t hash = PrefixCache::hash_prefix(prompt, n_tokens);
+
+    // A slot may need making. Evicting an older donor to store a newer one is the LRU
+    // policy doing its job, not a failure.
+    std::optional<SeqId> slot = prefix_cache_.take_donor_slot();
+    if (!slot) {
+        if (auto victim = prefix_cache_.evict_lru_retained()) {
+            release_donor(*victim);
+            slot = prefix_cache_.take_donor_slot();
+        }
+    }
+    if (!slot) {
+        return;
+    }
+
+    try {
+        // Register the donor slot before copying into it. A sequence only exists once the
+        // engine knows about it, so copying into an unregistered slot silently does
+        // nothing -- and a later hit then inherits an empty prefix and produces wrong
+        // output rather than merely missing.
+        engine_.begin_sequence(*slot, SamplingParams{});
+
+        // Preserve the KV itself. Without this the allocator would refcount blocks while
+        // llama.cpp had already reclaimed the cells behind them -- a hit would then copy
+        // garbage, which is far worse than a miss.
+        engine_.copy_sequence(job.state->seq(), *slot, static_cast<Pos>(n_tokens));
+    } catch (const std::exception&) {
+        engine_.release_sequence(*slot);
+        prefix_cache_.evict_sequence(*slot);  // hands the slot back
+        return;
+    }
+
+    // Take a reference so the blocks survive this job's release().
+    std::vector<BlockId> blocks(job.blocks->blocks().begin(),
+                                job.blocks->blocks().begin() + n_blocks);
+    for (const BlockId id : blocks) {
+        blocks_->incref(id);
+    }
+    prefix_cache_.retain(hash, *slot, n_tokens, std::move(blocks));
+    stats_.donors_retained.fetch_add(1, std::memory_order_relaxed);
+    stats_.donors_held.store(prefix_cache_.donors_held(), std::memory_order_relaxed);
+}
+
+// Give back everything an evicted donor was holding.
+void Scheduler::release_donor(const PrefixCache::Entry& donor) {
+    blocks_->free(donor.blocks);
+    engine_.release_sequence(donor.seq);
+    stats_.donor_evictions.fetch_add(1, std::memory_order_relaxed);
+    stats_.donors_held.store(prefix_cache_.donors_held(), std::memory_order_relaxed);
+}
+
+// Reclaim cache to satisfy a block shortfall, returning true if anything was freed.
+//
+// Called before preemption on purpose: a donor is pure cache whose loss costs a recompute
+// later, while a live sequence is work already in progress. Cache yields to work.
+bool Scheduler::reclaim_donor_blocks() {
+    auto victim = prefix_cache_.evict_lru_retained();
+    if (!victim) {
+        return false;
+    }
+    release_donor(*victim);
+    return true;
 }
 
 // Move a Job's request back out so it can be retried later. Used when a sequence is
@@ -302,6 +417,12 @@ void Scheduler::run_continuous() {
                 blocks_->blocks_for(job->state->usage().prompt_tokens);
             const std::uint32_t headroom =
                 active.empty() ? 0 : static_cast<std::uint32_t>(active.size()) + 1;
+
+            // Retained prefixes are cache, not work. Give them up rather than make a real
+            // request wait -- the same rule applied when a running sequence is starved.
+            while (blocks_->free_blocks() < want + headroom && reclaim_donor_blocks()) {
+            }
+
             const bool fits = job->state->finished() ||
                               (blocks_->free_blocks() >= want + headroom &&
                                job->blocks->ensure_capacity(job->state->usage().prompt_tokens));
@@ -491,6 +612,13 @@ void Scheduler::run_continuous() {
                     FinishReason::kContextOverflow);
                 starved->state->finish();
                 continue;
+            }
+
+            // Cache yields to work: drop retained prefixes before killing a live sequence.
+            // Losing a donor costs a recompute for some future request; preempting costs
+            // the work this one has already done. Donors are also the cheaper thing to give
+            // up, since nothing is waiting on them right now.
+            while (!starved->blocks->ensure_capacity(needed) && reclaim_donor_blocks()) {
             }
 
             // Otherwise evicting others is guaranteed to make room eventually: with every
