@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: microvllm
+  labels:
+    app: microvllm
+spec:
+  type: ClusterIP
+  selector:
+    app: microvllm
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+
+  # sessionAffinity is doing real work here, not ceremony.
+  #
+  # Two reasons default round-robin is wrong for LLM serving specifically:
+  #
+  # 1. KV cache is per-pod state. Prefix sharing -- including donors retained past their
+  #    request's retirement -- only pays off when a request lands on the pod that holds the
+  #    prefix. Round-robin makes that a 1-in-N chance and silently discards a measured 2.25x
+  #    on repeated-prefix traffic. The feature does not break; it just stops mattering,
+  #    which is worse because nothing reports it.
+  #
+  # 2. Requests cost wildly different amounts (16 vs 512 tokens). Round-robin keeps feeding
+  #    a pod that is grinding through long generations, which is exactly the head-of-line
+  #    blocking continuous batching removed *inside* one process, reappearing *between*
+  #    processes.
+  #
+  # ClientIP affinity is the crude fix available in a plain Service: it buys cache locality
+  # but keys on client address, so it degrades with few clients or a shared NAT, and it is
+  # blind to how loaded a pod is. The real answer is a queue-depth-aware proxy routing on a
+  # prompt-prefix hash -- /metrics already publishes the queue depth it would need.
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600

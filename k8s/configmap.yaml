@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: microvllm-config
+  labels:
+    app: microvllm
+data:
+  # Threads must match the CPU limit. Oversubscribing measurably hurts: the Phase 0 sweep
+  # showed 12 threads on 14 hardware threads dropping decode to 43.57 tok/s against 63.39 at
+  # 8, because the model competes with system threads. Under a cgroup CPU limit the effect
+  # is worse, since the kernel throttles rather than descheduling politely.
+  MICROVLLM_THREADS: "4"
+
+  # Sequences packed into one forward pass. Measured peak was 16 on bare metal; 8 is the
+  # right default under a 4-CPU limit, where less compute is available per step and the KV
+  # working set is what starts to bite.
+  MICROVLLM_BATCH_SIZE: "8"
+
+  # Requests allowed to wait before the server answers 503. Bounded on purpose: an unbounded
+  # queue converts overload into unbounded latency, which looks healthy to every probe while
+  # every client times out. Shedding load is the honest failure mode.
+  MICROVLLM_QUEUE: "64"

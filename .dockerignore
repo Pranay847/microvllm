@@ -1,0 +1,39 @@
+# The build context is sent to the daemon in full before anything runs, so excluding the
+# large directories here is the difference between a fast build and a slow one.
+
+# Model weights (469 MB) -- mounted at runtime, never baked in.
+models/
+*.gguf
+
+# Local build trees. The image builds from scratch inside the builder stage; copying host
+# artifacts in would at best waste time and at worst mix incompatible objects.
+build/
+out/
+cmake-build-*/
+_deps/
+
+# llama.cpp's git history is ~200 MB of the submodule and is not needed to compile it.
+.git/
+third_party/llama.cpp/.git/
+
+# Benchmark and docs artifacts
+benchmarks/results/
+docs/
+*.perf
+perf.data*
+
+# Editor / OS
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+*.swp
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+
+# Deployment definitions are applied by kubectl, not consumed by the build.
+k8s/
+Dockerfile
+.dockerignore
