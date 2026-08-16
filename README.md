@@ -179,6 +179,24 @@ expensive, TPOT means decode did.
 
 ---
 
+## Kubernetes
+
+Containerized and verified end to end on a local `kind` cluster — real generation served
+through the Service, metrics scraped, and **a rollout completed without dropping an in-flight
+request** (the SIGTERM drain earning itself).
+
+```bash
+kind create cluster --config k8s/kind-cluster.yaml
+docker build -t microvllm:dev . && kind load docker-image microvllm:dev --name microvllm
+kubectl apply -f k8s/
+```
+
+The image is 35 MB on-node; the 469 MB model is mounted rather than baked in. Several
+manifest choices are deliberate departures from generic k8s advice — round-robin load
+balancing destroys prefix-cache locality, a rolling update makes two pods contend for the
+memory bandwidth decode depends on, and an aggressive readiness probe turns a busy pod into a
+fleet-wide cascade. Reasoning in [docs/deployment.md](docs/deployment.md).
+
 ## Testing
 
 **124 tests**, all first-party, all running against the mock engine with no model loaded.

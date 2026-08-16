@@ -1,0 +1,156 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: microvllm
+  labels:
+    app: microvllm
+spec:
+  # One replica by default, and scaling out is not the reflex it usually is. Decode is
+  # memory-bandwidth-bound (measured: 1.75x throughput for 5x the threads), so two pods on
+  # one node contend for the same bandwidth and do not give 2x. Each replica also holds its
+  # own copy of the weights plus its own KV cache -- nothing is shared. Scale across nodes,
+  # not within one.
+  replicas: 1
+
+  # Recreate, not RollingUpdate. A rolling update would run two pods on one node during the
+  # rollover, each loading 463 MiB of weights and competing for the memory bandwidth the
+  # running one needs. On a single-node cluster that is a self-inflicted latency spike.
+  # Multi-node clusters with anti-affinity can safely switch this back to RollingUpdate.
+  strategy:
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: microvllm
+
+  template:
+    metadata:
+      labels:
+        app: microvllm
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # The server drains on SIGTERM: it stops accepting, finishes in-flight requests, and
+      # exits. That takes as long as the longest running generation, so the grace period
+      # must exceed it or Kubernetes SIGKILLs mid-request on every rollout. 90s covers a
+      # 512-token generation with headroom.
+      terminationGracePeriodSeconds: 90
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+
+      containers:
+        - name: microvllm
+          image: microvllm:dev
+          imagePullPolicy: IfNotPresent
+
+          args:
+            - --model
+            - /models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            - --threads
+            - "$(MICROVLLM_THREADS)"
+            - --batch-size
+            - "$(MICROVLLM_BATCH_SIZE)"
+            - --queue
+            - "$(MICROVLLM_QUEUE)"
+            - --quiet
+            - --log-requests
+
+          # Declared individually rather than with envFrom. Kubernetes only expands
+          # $(VAR) in args from variables listed in `env:` -- values injected by envFrom
+          # are present in the process environment but are NOT substituted, so the flags
+          # above would arrive as the literal string "$(MICROVLLM_THREADS)" and atoi()
+          # would read it as 0 threads. Silent misconfiguration, not an error.
+          env:
+            - name: MICROVLLM_THREADS
+              valueFrom:
+                configMapKeyRef:
+                  name: microvllm-config
+                  key: MICROVLLM_THREADS
+            - name: MICROVLLM_BATCH_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: microvllm-config
+                  key: MICROVLLM_BATCH_SIZE
+            - name: MICROVLLM_QUEUE
+              valueFrom:
+                configMapKeyRef:
+                  name: microvllm-config
+                  key: MICROVLLM_QUEUE
+
+          ports:
+            - name: http
+              containerPort: 8080
+
+          # Three probes, doing three different jobs -- collapsing them is the usual mistake.
+          #
+          # startupProbe: loading a 469 MB model takes ~13s measured. Without this, the
+          # liveness probe fires during startup and kills the pod before it can ever serve,
+          # producing a crash loop that looks like a broken image.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24        # up to 120s for a cold start on a slow node
+
+          # readiness: gates traffic. Under sustained load the queue fills and requests are
+          # rejected with 503, but the pod is healthy -- so this must NOT be aggressive, or
+          # a busy pod removes itself from the Service and pushes its load onto its peers,
+          # which then do the same. That cascade is how a fleet fails all at once.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # liveness: restarts only a genuinely wedged process. Deliberately slack, because
+          # a restart throws away every in-flight request and the KV cache with them.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            failureThreshold: 6         # ~2 minutes unresponsive before a restart
+
+          resources:
+            # requests == limits puts the pod in the Guaranteed QoS class. That matters more
+            # than usual here: decode is bandwidth-sensitive, so being throttled or having a
+            # noisy neighbour shows up directly as inter-token latency, not just slower
+            # throughput. Guaranteed pods are also evicted last under node pressure.
+            requests:
+              cpu: "4"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 2Gi
+
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      volumes:
+        # hostPath keeps this runnable on kind with the model bind-mounted into the node.
+        # A real cluster would use a ReadOnlyMany PVC or an initContainer that pulls the
+        # GGUF from object storage -- the container does not care which, since it only ever
+        # reads a file at /models.
+        - name: models
+          hostPath:
+            path: /models
+            type: Directory

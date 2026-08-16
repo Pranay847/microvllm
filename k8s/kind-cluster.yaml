@@ -1,0 +1,22 @@
+# Local kind cluster for verifying the deployment end to end.
+#
+# The only non-default piece is extraMounts: the 469 MB model lives on the host and is bind-
+# mounted into the node, so the Deployment's hostPath volume resolves. That mirrors what a
+# real cluster does with a PVC without needing storage infrastructure to try it.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: microvllm
+nodes:
+  - role: control-plane
+    extraMounts:
+      # Host path is machine-specific. On Windows/Docker Desktop use the drive form
+      # (C:\...); on Linux/macOS use an absolute POSIX path.
+      - hostPath: C:\Users\Prana\microvllm\models
+        containerPath: /models
+        readOnly: true
+    extraPortMappings:
+      # Exposes the NodePort on the host so the service can be reached without
+      # kubectl port-forward. 30080 is inside the default NodePort range.
+      - containerPort: 30080
+        hostPort: 30080
+        protocol: TCP
