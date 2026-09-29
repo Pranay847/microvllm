@@ -62,6 +62,9 @@ struct Args {
                  "                    Lower it to exercise admission control and preemption\n"
                  "  --block-size <n>  tokens per KV block (default 16)\n"
                  "  --no-prefix-cache disable KV sharing between common prompt prefixes\n"
+                 "  --prefix-donors <n>  prefixes retained past their request's exit\n"
+                 "                    (default 4, 0 = off)\n"
+                 "  --log-requests    emit one JSON line per completed request\n"
                  "  --quiet           silence llama.cpp info logging\n"
                  "  --help\n",
                  microvllm::kVersion, prog, prog);
