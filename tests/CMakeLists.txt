@@ -4,6 +4,7 @@
 add_executable(microvllm_tests
     test_types.cpp
     test_timing.cpp
+    test_latency_histogram.cpp
     test_mock_engine.cpp
     test_generator.cpp
     test_http_api.cpp
